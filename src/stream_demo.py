@@ -555,7 +555,7 @@ def draw(frame: np.ndarray, spd: dict, k: float, fps: float) -> np.ndarray:
 def main() -> int:
     ap = argparse.ArgumentParser(description="卫星视频车辆流式识别（单文件版）")
     ap.add_argument("--input", required=True, help="输入视频或图片序列目录")
-    ap.add_argument("--model", default="model/a_p2_nwd_full2_raw_fp32.onnx")
+    ap.add_argument("--model", default="model/a_p2_nwd_v3_raw_fp32.onnx")
     ap.add_argument("--conf", type=float, default=0.35)
     ap.add_argument("--k", type=float, default=0.92, help="米/像素（0=未标定，只显示 px/帧）")
     ap.add_argument("--fps", type=float, default=10.0, help="源视频帧率（测速用）")
