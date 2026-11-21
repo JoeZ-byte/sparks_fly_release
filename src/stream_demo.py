@@ -579,6 +579,21 @@ class Tracker:
         self.next_id = 1
         self.frame = 0
 
+    def seed(self, items: list[tuple[int, np.ndarray, float]]) -> None:
+        """用"回溯"得到的 (id, box, score) 播种轨迹，让第 1 帧就有稳定编号。"""
+        self.tracks = []
+        self.dead = []
+        top = 0
+        for tid, box, score in items:
+            tk = _Track(np.asarray(box, np.float32), float(score))
+            tk.pid = int(tid)
+            tk.hits = max(self.min_hits, 1)      # 直接视为已确认
+            tk.tsu = 0
+            self.tracks.append(tk)
+            top = max(top, int(tid))
+        self.next_id = top + 1
+        self.frame = 0
+
     def coast(self) -> list[_Track]:
         """不做检测的帧：只让卡尔曼外推一帧，用于检测周期化。
 
@@ -781,6 +796,72 @@ def _infer_batch(sess, crops: list[np.ndarray], imgsz: int, conf: float,
     return out
 
 
+def prewarm_lookback(cap, prop, pool, sess, gpu, anchors, strides, args,
+                     n_frames: int, show_black=None):
+    """黑屏预热 + 倒序回溯：先正向算 N 帧，再反向跑跟踪，得到第 1 帧的车辆 ID。
+
+    为什么要反向：正向从空轨迹开始，车要跑 3 帧才"转正"（min_hits=3），
+    所以直接播放时前几帧是无号的。把 N 帧的检测结果**倒序**喂给跟踪器，
+    ID 会从后往前传播，回到第 1 帧时每辆车都已经有号。
+    """
+    frames, dets = [], []
+    for i in range(n_frames):
+        ok, frame = cap.read()
+        if not ok:
+            break
+        frames.append(frame)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        prop.propose(gray, np.zeros((0, 4), np.float32))     # 推进背景模型
+        origins = prop.warmup_grid() if i < 12 else prop.propose(
+            gray, np.zeros((0, 4), np.float32))
+        crops, rects, seen = [], [], set()
+        for x0, y0 in origins:
+            x0 = max(0, min(frame.shape[1] - TILE, int(x0)))
+            y0 = max(0, min(frame.shape[0] - TILE, int(y0)))
+            if (x0, y0) in seen:
+                continue
+            seen.add((x0, y0))
+            crops.append(frame[y0:y0 + TILE, x0:x0 + TILE])
+            rects.append((x0, y0))
+        if gpu is not None:
+            res = gpu.infer(crops, args.conf)
+        elif pool is not None:
+            res = pool.infer(crops)
+        else:
+            res = _infer_batch(sess, crops, args.imgsz, args.conf, anchors, strides)
+        db, sb = [], []
+        for (x0, y0), (b, s) in zip(rects, res):
+            if len(b):
+                db.append(b + np.asarray([x0, y0, x0, y0], np.float32))
+                sb.append(s)
+        if db:
+            d = np.concatenate(db)
+            s = np.concatenate(sb)
+            keep = nms(d, s, 0.5)
+            dets.append((d[keep], s[keep]))
+        else:
+            dets.append((np.zeros((0, 4), np.float32), np.zeros(0, np.float32)))
+        if show_black is not None and i % 3 == 0:
+            try:
+                img = np.zeros((360, 640, 3), np.uint8)
+                cv2.putText(img, f"initializing {i + 1}/{n_frames}", (40, 180),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2, cv2.LINE_AA)
+                cv2.imshow("satstream", img)
+                cv2.waitKey(1)
+            except cv2.error:
+                pass
+
+    # 反向跑跟踪，让 ID 从最后一帧往回流
+    tr = Tracker()
+    first_ids = []
+    for i in range(len(dets) - 1, -1, -1):
+        tr.update(dets[i][0], dets[i][1])
+        if i == 0:
+            first_ids = [(t.pid, t.box.copy(), t.score) for t in tr.tracks
+                         if t.pid is not None]
+    return frames, first_ids
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="卫星视频车辆流式识别（单文件版）")
     ap.add_argument("--input", required=True, help="输入视频或图片序列目录")
@@ -789,6 +870,8 @@ def main() -> int:
     ap.add_argument("--k", type=float, default=0.92, help="米/像素（0=未标定，只显示 px/帧）")
     ap.add_argument("--fps", type=float, default=10.0, help="源视频帧率（测速用）")
     ap.add_argument("--warmup", type=int, default=15, help="冷启动网格帧数")
+    ap.add_argument("--prewarm", type=int, default=20,
+                    help="黑屏预热帧数：先正算再倒序回溯，让第 1 帧就带稳定 ID（0=关闭）")
     ap.add_argument("--max-cells", type=int, default=6,
                     help="每帧最多推理的图块数（算力预算，越小越快）")
     ap.add_argument("--backend", choices=["auto", "onnx", "torch"], default="auto",
@@ -922,6 +1005,28 @@ def main() -> int:
     if args.save:
         writer = cv2.VideoWriter(args.save, cv2.VideoWriter_fourcc(*"mp4v"),
                                  args.fps, (W, H))
+
+    # ---- 黑屏预热 + 倒序回溯：让播放第一帧起每辆车都有编号 ----
+    if args.prewarm > 0:
+        try:
+            cv2.namedWindow("satstream", cv2.WINDOW_AUTOSIZE)
+            img = np.zeros((360, 640, 3), np.uint8)
+            cv2.putText(img, "initializing...", (40, 180),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2, cv2.LINE_AA)
+            cv2.imshow("satstream", img)
+            cv2.waitKey(1)
+        except cv2.error:
+            pass
+        _frames, first_ids = prewarm_lookback(
+            cap, prop, pool, sess, gpu, anchors, strides, args, args.prewarm,
+            show_black=None if args.no_show else True)
+        if first_ids:
+            tracker.seed(first_ids)
+            print(f"  回溯完成：第 1 帧已有 {len(first_ids)} 辆车带 ID", flush=True)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        prop = MotionProposer(W, H, thr=40.0, max_cells=prop.max_cells)
+        speed = SpeedEstimator(args.k, args.fps)
+        warm_grid = prop.warmup_grid()
 
     fno = 0
     t0 = time.perf_counter()
