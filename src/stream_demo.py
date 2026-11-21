@@ -579,13 +579,23 @@ class Tracker:
         self.next_id = 1
         self.frame = 0
 
-    def seed(self, items: list[tuple[int, np.ndarray, float]]) -> None:
-        """用"回溯"得到的 (id, box, score) 播种轨迹，让第 1 帧就有稳定编号。"""
+    def seed(self, items: list[tuple]) -> None:
+        """用"回溯"得到的 (id, box, score, vx, vy) 播种轨迹。
+
+        速度要**取负**：回溯是倒着想时间跑的，其速度方向与实际相反；
+        不播种速度的话，轨迹会被当成静止目标（卡尔曼预测不动 → 测速≈0 →
+        被静止门限过滤），表现就是"头几帧没有框"。
+        """
         self.tracks = []
         self.dead = []
         top = 0
-        for tid, box, score in items:
+        for item in items:
+            tid, box, score = item[0], item[1], item[2]
+            vx = float(item[3]) if len(item) > 3 else 0.0
+            vy = float(item[4]) if len(item) > 4 else 0.0
             tk = _Track(np.asarray(box, np.float32), float(score))
+            tk.kf.x[4, 0] = -vx          # 反向 -> 正向
+            tk.kf.x[5, 0] = -vy
             tk.pid = int(tid)
             tk.hits = max(self.min_hits, 1)      # 直接视为已确认
             tk.tsu = 0
@@ -668,7 +678,9 @@ class Tracker:
                 alive.append(t)
         self.tracks = alive
         self.dead = [d for d in self.dead if self.frame - d[4] <= 12][-64:]
-        return [t for t in self.tracks if t.pid is not None and t.tsu == 0]
+        # 输出所有已确认轨迹：tsu<=3 允许短时外推（车辆被遮挡/本帧没覆盖到的格子时
+        # 仍按卡尔曼预测显示，播放时不会"闪没"；超过 3 帧才隐藏，避免幽灵框）。
+        return [t for t in self.tracks if t.pid is not None and t.tsu <= 2]
 
     def _revive(self, box: np.ndarray, score: float) -> bool:
         if not self.dead:
@@ -737,6 +749,9 @@ class SpeedEstimator:
             out[tid] = {
                 "px": float(px) if px is not None else float(math.hypot(vx, vy)),
                 "src": "interval" if px is not None else "kalman",
+                # ready=False 表示速度还没测出来（历史不足 4 帧），此时不应该
+                # 套用"静止目标不画"的门限，否则新出现的车会整帧消失
+                "ready": px is not None,
                 "box": t.box,
             }
         return out
@@ -756,8 +771,10 @@ def draw(frame: np.ndarray, spd: dict, k: float, fps: float,
     for tid, s in sorted(spd.items(), key=lambda kv: -kv[1]["px"]):
         x1, y1, x2, y2 = (int(round(v * scale)) for v in s["box"])
         px = s["px"]
-        # 静止门限：连续低速目标不显示（交通流只关心在动的车）
-        if px < 0.2:
+        # 静止门限：连续低速目标不显示（交通流只关心在动的车）。
+        # 但"速度还没测出来"的轨迹（刚出现/刚播种）必须先画出来，
+        # 否则播放头几帧会是空的。
+        if s.get("ready", True) and px < 0.2:
             continue
         if k > 0:
             kmh = 3.6 * px * k * fps
@@ -857,8 +874,9 @@ def prewarm_lookback(cap, prop, pool, sess, gpu, anchors, strides, args,
     for i in range(len(dets) - 1, -1, -1):
         tr.update(dets[i][0], dets[i][1])
         if i == 0:
-            first_ids = [(t.pid, t.box.copy(), t.score) for t in tr.tracks
-                         if t.pid is not None]
+            first_ids = [(t.pid, t.box.copy(), t.score,
+                          float(t.kf.vel[0]), float(t.kf.vel[1]))
+                         for t in tr.tracks if t.pid is not None]
     return frames, first_ids
 
 
@@ -885,7 +903,7 @@ def main() -> int:
                     help="推理进程数（默认 1；实测多进程在 CPU 上无收益）")
     ap.add_argument("--imgsz", type=int, default=0,
                     help="图块送入网络的边长（384 更快、精度略降）")
-    ap.add_argument("--threads", type=int, default=8,
+    ap.add_argument("--threads", type=int, default=5,
                     help="ORT 线程数（8 是实测甜点；再开因内存带宽反而变慢）")
     ap.add_argument("--det-every", type=int, default=1,
                     help="检测周期：N 表示每 N 帧检测一次（>1 会明显掉召回，仅供极限提速）")
@@ -899,6 +917,7 @@ def main() -> int:
                     help="CPU 用 INT8 量化模型（约 2.3 倍提速，精度不降）")
     ap.add_argument("--save", default="", help="保存叠加结果视频（可选）")
     ap.add_argument("--csv", default="", help="把逐帧结果写成 CSV（评测用）")
+    ap.add_argument("--profile", action="store_true", help="打印各阶段耗时")
     ap.add_argument("--display-scale", type=float, default=0.7)
     ap.add_argument("--no-show", action="store_true", help="不弹窗口（批量/无显示环境）")
     ap.add_argument("--max-frames", type=int, default=0, help="只处理前 N 帧（0=全部）")
@@ -950,7 +969,7 @@ def main() -> int:
                 print(f"GPU 后端不可用（{type(exc).__name__}: {exc}）；回退 CPU")
                 backend_kind = "onnx"
 
-    n_cpu = args.threads if args.threads > 0 else min(8, os.cpu_count() or 4)
+    n_cpu = args.threads if args.threads > 0 else min(5, os.cpu_count() or 4)
     # CPU 路径默认优先用 INT8 量化模型（同精度、约 2.3 倍提速）
     if backend_kind == "onnx" and not args.no_int8:
         # 优先用与 --imgsz 匹配的 INT8 模型（量化后的图尺寸是固定的）
@@ -996,6 +1015,12 @@ def main() -> int:
     speed = SpeedEstimator(args.k, args.fps)
     warm_grid = prop.warmup_grid()
 
+    prof = {} if args.profile else None
+
+    def _tick(name, t0):
+        if prof is None:
+            return
+        prof[name] = prof.get(name, 0.0) + time.perf_counter() - t0
     det_every = max(1, args.det_every)
     target_fps = args.target_fps if args.target_fps > 0 else (25.0 if gpu is not None else 12.0)
     csv_fh = open(args.csv, "w", encoding="utf-8", newline="") if args.csv else None
@@ -1022,12 +1047,20 @@ def main() -> int:
             show_black=None if args.no_show else True)
         if first_ids:
             tracker.seed(first_ids)
+            for _tid, _box, _sc, _vx, _vy in first_ids:
+                speed.ewma[int(_tid)] = float(math.hypot(-_vx, -_vy))
             print(f"  回溯完成：第 1 帧已有 {len(first_ids)} 辆车带 ID", flush=True)
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
         prop = MotionProposer(W, H, thr=40.0, max_cells=prop.max_cells)
         speed = SpeedEstimator(args.k, args.fps)
         warm_grid = prop.warmup_grid()
+        full_grid = prop.warmup_grid(stride=1)      # 全网格：开播头几帧认领所有播种轨迹
 
+    full_grid = prop.warmup_grid(stride=1)
+    full_claim = 0
+    # 有回溯时不走冷启动网格：播种轨迹本身就是"车辆在哪"的先验，
+    # 再用 4 格稀疏网格会在第 8~15 帧出现明显空窗（实测框数从 44 掉到 6）。
+    warm_frames = 0 if args.prewarm > 0 else args.warmup
     fno = 0
     t0 = time.perf_counter()
     window: list[float] = []
@@ -1090,7 +1123,9 @@ def main() -> int:
 
         # ---- 提案 ----
         tb = np.asarray([t.box for t in tracker.tracks], np.float32).reshape(-1, 4)
-        if fno <= args.warmup:
+        if fno <= full_claim:
+            origins = full_grid          # 可选：头几帧全画面扫描
+        elif fno <= warm_frames:
             origins = warm_grid
         else:
             origins = prop.propose(gray, tb)
@@ -1112,6 +1147,7 @@ def main() -> int:
             rects.append((x0, y0))
 
         # ---- 推理 + 解码 ----
+        _ip0 = time.perf_counter()
         if gpu is not None:
             # 恒定批量：TorchScript 对每个 batch 形状都要重新准备执行计划，
             # 4 块/6 块来回切换会出现秒级卡顿（实测单帧 2~6 秒）。
@@ -1127,6 +1163,7 @@ def main() -> int:
         else:
             results = _infer_batch(sess, crops, args.imgsz, args.conf, anchors, strides)
 
+        _tick("infer", _ip0)
         dets, scores = [], []
         for (x0, y0), (b, s) in zip(rects, results):
             if len(b):
@@ -1144,8 +1181,12 @@ def main() -> int:
             scores = np.zeros(0, np.float32)
 
         # ---- 跟踪 + 车速 + 渲染 ----
+        _tp0 = time.perf_counter()
         tracks = tracker.update(dets, scores)
+        _tick("track", _tp0)
+        _sp0 = time.perf_counter()
         spd = speed.update(tracks, fno)
+        _tick("speed", _sp0)
         if csv_fh is not None:
             for tid, st in spd.items():
                 b = st["box"]
@@ -1174,6 +1215,7 @@ def main() -> int:
                         (0, 255, 255), 2, cv2.LINE_AA)
         if show:
             try:
+                _dp0 = time.perf_counter()
                 if not win_ready:
                     # WINDOW_AUTOSIZE + 与图像同尺寸：避免 imshow 每帧内部缩放
                     cv2.namedWindow("satstream", cv2.WINDOW_AUTOSIZE)
@@ -1181,6 +1223,7 @@ def main() -> int:
                 cv2.imshow("satstream", disp)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
+                _tick("display", _dp0)
             except cv2.error:
                 show = False           # 无显示环境：自动退化为只存视频
                 print("（检测到无显示环境，已切换为 --no-show 模式）", flush=True)
@@ -1190,6 +1233,10 @@ def main() -> int:
     cap.release()
     if writer is not None:
         writer.release()
+    if prof:
+        print("  阶段耗时(ms/帧): " + "  ".join(
+            f"{k}={v / max(1, fno) * 1000:.1f}" for k, v in
+            sorted(prof.items(), key=lambda kv: -kv[1])), flush=True)
     if pool is not None:
         pool.close()
     if csv_fh is not None:
