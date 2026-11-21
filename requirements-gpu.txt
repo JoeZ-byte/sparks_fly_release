@@ -1,0 +1,3 @@
+# GPU 加速（可选，但强烈推荐：1024² 视频从 4 FPS 提到 26~42 FPS）
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+torch>=2.0

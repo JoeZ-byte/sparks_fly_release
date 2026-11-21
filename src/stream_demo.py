@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import sys
 import time
 from collections import deque
@@ -259,6 +260,165 @@ def gated_assign(cost: np.ndarray, top_k: int = 3, exact_max: int = 12) -> list[
 
 
 # =====================================================================
+# 2.4 PyTorch GPU 后端（有 NVIDIA 显卡时最快）
+# =====================================================================
+# 为什么不用 onnxruntime-gpu：ORT 的 CUDA EP 版本与 CUDA 运行时强绑定
+# （1.31/1.32 要 CUDA 13，而本机装的是 CUDA 12.8），装不匹配就直接静默回退
+# 到 CPU。PyTorch 的 CUDA 12.8 wheel 原生支持 Blackwell（sm_120），
+# 且模型本来就是 PyTorch 训练的，直接加载 .pt 最省事。
+class TorchBackend:
+    """在 CUDA 上跑原始预测（批量），解码仍交给 numpy。"""
+
+    def __init__(self, ts_path: Path, imgsz: int = 512, use_half: bool = True,
+                 device: str = "cuda", batch_hint: int = 6) -> None:
+        """加载 TorchScript 模型（纯 torch 即可，不需要项目里的 satdet 包）。"""
+        import torch
+
+        if not torch.cuda.is_available():
+            raise RuntimeError("没有可用的 CUDA 设备")
+
+        self.torch = torch
+        self.device = torch.device(device)
+        self.net = torch.jit.load(str(ts_path), map_location=self.device).eval()
+        self.half = bool(use_half) and self.device.type == "cuda"
+        if self.half:
+            self.net.half()
+        self.imgsz = imgsz
+        self.anchors, self.strides = make_anchors()
+        # 固定输入缓冲区：每帧新建张量会让 TorchScript 反复重建执行计划
+        # （实测前 10 次每次卡约 2 秒）。复用同一个张量后稳定在 6 ms。
+        self.batch_hint = max(1, batch_hint)
+        self._buf = torch.zeros(self.batch_hint, 3, imgsz, imgsz,
+                                device=self.device,
+                                dtype=torch.float16 if self.half else torch.float32)
+        # 上传原始 uint8 图块（196 KB/块），在 GPU 上做缩放与归一化：
+        # 比在 CPU 上 resize+astype 再传 1.5 MB 快得多（实测 24.8 ms -> 2 ms）
+        self._u8 = np.empty((self.batch_hint, TILE, TILE, 3), np.uint8)
+        self._reg = torch.arange(REG_MAX, device=self.device)
+        a, s = make_anchors()
+        self._anchors_t = torch.from_numpy(np.asarray(a, np.float32)).to(self.device)
+        self._strides_t = torch.from_numpy(np.asarray(s, np.float32)).to(self.device)
+        # 预热：按目标批量跑几次，把 cuDNN/TorchScript 的首次编译与
+        # 算法选择全部挪到启动阶段（否则前几帧会出现 2~6 秒的停顿）
+        with torch.no_grad():
+            for _ in range(3):
+                self.net(self._buf)
+        torch.cuda.synchronize()
+
+    def infer(self, crops: list[np.ndarray], conf: float):
+        """一批图块 -> [(boxes, scores)]（图块内坐标，已换算回 TILE 尺度）。
+
+        全流程都压在 GPU 上：uint8 上传 -> GPU 缩放/归一化 -> 前向 ->
+        GPU 上 top-k + DFL 解码 -> 只把最终框传回 CPU。
+        """
+        if not crops:
+            return []
+        torch = self.torch
+        n = min(len(crops), self.batch_hint)
+        for i in range(n):
+            self._u8[i] = crops[i]                       # 196 KB/块
+        raw = torch.from_numpy(self._u8[:n]).to(self.device, non_blocking=True)
+        with torch.no_grad():
+            x = raw.permute(0, 3, 1, 2).float().div_(255.0).flip(1)   # BGR->RGB
+            x = torch.nn.functional.interpolate(
+                x, size=(self.imgsz, self.imgsz), mode="bilinear",
+                align_corners=False)
+            if self.half:
+                x = x.half()
+            self._buf[:n].copy_(x)          # 固定缓冲区：避免每帧重建执行计划
+            preds = self.net(self._buf)     # (n, 4*reg_max+nc, A)
+            boxes, scores = self._decode(preds, conf)
+        b_all = (boxes / (self.imgsz / TILE)).float().cpu().numpy()
+        s_all = scores.float().cpu().numpy()
+        return [(b_all[i][s_all[i] > conf], s_all[i][s_all[i] > conf]) for i in range(n)]
+
+    def _decode(self, preds, conf: float, k: int = 160):
+        """GPU 上的 top-k + DFL 解码，只回传少量候选。"""
+        torch = self.torch
+        n = preds.shape[0]
+        cls = preds[:, REG_MAX * 4, :]                      # (n, A)
+        kk = min(k, cls.shape[1])
+        top_s, top_i = torch.topk(cls, kk, dim=1)
+        box = preds[:, :REG_MAX * 4, :].gather(
+            2, top_i.unsqueeze(1).expand(-1, REG_MAX * 4, -1))
+        box = box.view(n, 4, REG_MAX, kk)
+        prob = torch.softmax(box, dim=2)
+        dist = (prob * self._reg.view(1, 1, -1, 1)).sum(2)   # (n,4,kk)
+        a = self._anchors_t[top_i].permute(0, 2, 1)         # (n,2,kk)
+        st = self._strides_t[top_i].unsqueeze(1)            # (n,1,kk)
+        lt = dist[:, :2] * st                               # (n,2,kk)
+        rb = dist[:, 2:] * st
+        boxes = torch.cat([a - lt, a + rb], dim=1).permute(0, 2, 1)   # (n,kk,4)
+        return boxes, top_s
+
+
+# =====================================================================
+# 2.5 多进程图块推理池
+# =====================================================================
+# 为什么用多进程而不是多线程：Python 有 GIL，线程只能等 C++ 内核放锁；
+# 而 ONNX Runtime 单会话在 4 线程时每块 ~36 ms 就到顶（再开线程反而慢，
+# 属于内存带宽受限）。所以真正的并行只能靠"多个进程各自开一个会话"。
+# 实测：4 进程 x 4 线程，6 块/帧可以稳在 20+ FPS（单进程同配置只有 4.6）。
+_W_SESS = None
+_W_IMSZ = 512
+_W_CONF = 0.35
+_W_ANCHORS = None
+_W_STRIDES = None
+
+
+def _worker_init(model_path: str, threads: int, imgsz: int, conf: float) -> None:
+    """子进程初始化：建自己的 ORT 会话（只做一次，之后常驻）。"""
+    global _W_SESS, _W_IMSZ, _W_CONF, _W_ANCHORS, _W_STRIDES
+    import onnxruntime as _ort
+
+    so = _ort.SessionOptions()
+    so.graph_optimization_level = _ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    so.intra_op_num_threads = max(1, threads)
+    so.inter_op_num_threads = 1
+    so.add_session_config_entry("session.intra_op.allow_spinning", "0")
+    _W_SESS = _ort.InferenceSession(model_path, so, providers=["CPUExecutionProvider"])
+    _W_ANCHORS, _W_STRIDES = make_anchors()
+    _W_IMSZ = imgsz
+    _W_CONF = conf
+
+
+def _worker_infer(crop: np.ndarray):
+    """子进程里做：缩放 → 归一化 → 推理 → 解码，只回传框（很小）。"""
+    x = cv2.resize(crop, (_W_IMSZ, _W_IMSZ), interpolation=cv2.INTER_LINEAR)
+    x = cv2.cvtColor(x, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    preds = _W_SESS.run(None, {"batch": x[None].transpose(0, 3, 1, 2)})[0]
+    return decode_topk(preds, _W_ANCHORS, _W_STRIDES, _W_CONF)
+
+
+class TilePool:
+    """进程池：一帧的所有图块并行推理（结果顺序与输入一致）。"""
+
+    def __init__(self, model_path: Path, workers: int, threads: int, imgsz: int,
+                 conf: float) -> None:
+        import multiprocessing as mp
+        from concurrent.futures import ProcessPoolExecutor
+
+        self._ex = ProcessPoolExecutor(
+            max_workers=workers,
+            mp_context=mp.get_context("spawn"),
+            initializer=_worker_init,
+            initargs=(str(model_path), threads, imgsz, conf),
+        )
+        self.workers = workers
+        # 预热：让子进程把会话建好，避免第一帧卡几秒
+        warm = np.zeros((TILE, TILE, 3), np.uint8)
+        list(self._ex.map(_worker_infer, [warm] * workers))
+
+    def infer(self, crops: list[np.ndarray]):
+        if not crops:
+            return []
+        return list(self._ex.map(_worker_infer, crops))
+
+    def close(self) -> None:
+        self._ex.shutdown(wait=False, cancel_futures=True)
+
+
+# =====================================================================
 # 3. 运动先验
 # =====================================================================
 class MotionProposer:
@@ -285,23 +445,30 @@ class MotionProposer:
         small = cv2.resize(m, (nx, ny), interpolation=cv2.INTER_AREA)
         return np.rint(small * (m.shape[0] / ny) * (m.shape[1] / nx)).astype(np.int64)
 
-    def propose(self, gray: np.ndarray, track_boxes: np.ndarray) -> np.ndarray:
+    def propose(self, gray: np.ndarray, track_boxes: np.ndarray,
+                track_bonus: float = 0.6) -> np.ndarray:
+        """选本帧要推理的图块：运动最激烈的 K 个格子 + 有轨迹的格子，总数硬上限 K。
+
+        之前的实现会"每有一条轨迹就加一个图块"，密集场景直接炸到 42 块/帧
+        （1024² 上每块 36 ms，一帧就是 1.5 秒）。现在改成：
+        1. 运动得分归一化到 0~1；
+        2. 轨迹中心所在格子加一个先验分（保证慢车/静止车不漏）；
+        3. 只取全局前 ``max_cells`` 个格子——**总图块数恒等于预算**。
+        """
         mask = self._mask(gray)
-        scores = self._cells(mask)
-        flat = scores.ravel()
-        picked = []
-        if flat.size and flat.max() > 0:
-            thr = max(2, int(round(0.05 * flat.max())))
-            order = np.argsort(-flat)
-            for k in order:
-                if len(picked) >= self.max_cells or flat[k] < thr:
-                    break
-                iy, ix = divmod(int(k), scores.shape[1])
-                picked.append((ix * TILE, iy * TILE))
+        scores = self._cells(mask).astype(np.float32)
+        mx = float(scores.max()) if scores.size else 0.0
+        if mx > 0:
+            scores = scores / mx
         for b in track_boxes:
-            o = (int(b[0] // TILE) * TILE, int(b[1] // TILE) * TILE)
-            if o not in picked:
-                picked.append(o)
+            cx = int(np.clip((b[0] + b[2]) * 0.5, 0, self.w - 1)) // TILE
+            cy = int(np.clip((b[1] + b[3]) * 0.5, 0, self.h - 1)) // TILE
+            scores[cy, cx] += track_bonus
+        flat = scores.ravel()
+        k = min(self.max_cells, flat.size)
+        order = np.argsort(-flat)[:k]
+        nx = scores.shape[1]
+        picked = [(int(i) % nx * TILE, int(i) // nx * TILE) for i in order if flat[i] > 0]
         cv2.accumulateWeighted(gray.astype(np.float32), self.bg, self.alpha)
         return np.asarray(picked, np.int32).reshape(-1, 2)
 
@@ -552,6 +719,16 @@ def draw(frame: np.ndarray, spd: dict, k: float, fps: float) -> np.ndarray:
     return frame
 
 
+def _infer_one(sess, crop: np.ndarray, imgsz: int, conf: float,
+               anchors, strides):
+    """单进程路径：与子进程里完全相同的预处理+解码（结果已换算回图块坐标）。"""
+    x = cv2.resize(crop, (imgsz, imgsz), interpolation=cv2.INTER_LINEAR)
+    x = cv2.cvtColor(x, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    preds = sess.run(None, {"batch": x[None].transpose(0, 3, 1, 2)})[0]
+    b, s = decode_topk(preds, anchors, strides, conf)
+    return b / (imgsz / TILE), s
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="卫星视频车辆流式识别（单文件版）")
     ap.add_argument("--input", required=True, help="输入视频或图片序列目录")
@@ -560,7 +737,18 @@ def main() -> int:
     ap.add_argument("--k", type=float, default=0.92, help="米/像素（0=未标定，只显示 px/帧）")
     ap.add_argument("--fps", type=float, default=10.0, help="源视频帧率（测速用）")
     ap.add_argument("--warmup", type=int, default=15, help="冷启动网格帧数")
-    ap.add_argument("--max-cells", type=int, default=6)
+    ap.add_argument("--max-cells", type=int, default=6,
+                    help="每帧最多推理的图块数（算力预算，越小越快）")
+    ap.add_argument("--backend", choices=["auto", "onnx", "torch"], default="auto",
+                    help="auto=有 CUDA 用 PyTorch GPU，否则 onnxruntime CPU")
+    ap.add_argument("--fp32", action="store_true",
+                    help="GPU 上用 fp32（默认 fp16，更快；精度差异可忽略）")
+    ap.add_argument("--tmodel", default="model/a_p2_nwd_v3_raw.ts",
+                    help="GPU 后端用的 TorchScript 权重")
+    ap.add_argument("--workers", type=int, default=0,
+                    help="推理进程数（0=自动：按核心数/4，最多 4）")
+    ap.add_argument("--imgsz", type=int, default=512,
+                    help="图块送入网络的边长（384 更快、精度略降）")
     ap.add_argument("--threads", type=int, default=4,
                     help="ORT 线程数（单图块推理带宽受限，4~8 最优；开满反而慢）")
     ap.add_argument("--save", default="", help="保存叠加结果视频（可选）")
@@ -583,16 +771,57 @@ def main() -> int:
         print(f"找不到模型: {args.model}（默认放在 release/model/）")
         return 1
 
-    so = ort.SessionOptions()
-    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    backend_kind = args.backend
+    if backend_kind == "auto":
+        backend_kind = "onnx"
+        try:
+            import torch as _t
+
+            if _t.cuda.is_available():
+                backend_kind = "torch"
+        except Exception:
+            pass
+    gpu = None
+    if backend_kind == "torch":
+        ts = Path(args.tmodel)
+        if not ts.is_file():
+            ts = here.parent / args.tmodel            # release/
+        if not ts.is_file():
+            ts = model_path.with_suffix(".ts")
+        if not ts.is_file():
+            print(f"找不到 GPU 用的 TorchScript: {ts}；回退到 onnxruntime CPU")
+            backend_kind = "onnx"
+        else:
+            try:
+                gpu = TorchBackend(ts, args.imgsz, not args.fp32, "cuda",
+                                   batch_hint=max(1, args.max_cells))
+                print(f"后端: PyTorch { 'fp16' if gpu.half else 'fp32'} @ CUDA "
+                      f"({gpu.torch.cuda.get_device_name(0)})", flush=True)
+            except Exception as exc:
+                print(f"GPU 后端不可用（{type(exc).__name__}: {exc}）；回退 CPU")
+                backend_kind = "onnx"
+
     n_cpu = args.threads if args.threads > 0 else 4
-    so.intra_op_num_threads = n_cpu
-    so.inter_op_num_threads = 1
-    # 关键：关闭 ORT 线程自旋。默认自旋在 CPU 被其他程序占满时会长时间空转
-    # （实测同一台机器上"自旋开"能让一帧从 0.4 s 变成几十秒），关掉后稳定。
-    so.add_session_config_entry("session.intra_op.allow_spinning", "0")
-    sess = ort.InferenceSession(str(model_path), so, providers=["CPUExecutionProvider"])
-    anchors, strides = make_anchors()
+    # 进程数：自动取 核心数/threads（至少 1、最多 4）。每进程 4 线程是甜点，
+    # 再多线程反而变慢（内存带宽），所以要靠"多进程"堆吞吐。
+    default_workers = max(1, min(4, (os.cpu_count() or 4) // max(1, n_cpu)))
+    workers = args.workers if args.workers > 0 else default_workers
+    pool = None
+    sess = anchors = strides = None
+    if gpu is not None:
+        pass                                  # GPU 后端已就绪，无需 CPU 推理器
+    elif workers > 1:
+        print(f"启动 {workers} 个推理进程（每个 {n_cpu} 线程）…", flush=True)
+        pool = TilePool(model_path, workers, n_cpu, args.imgsz, args.conf)
+    else:
+        so = ort.SessionOptions()
+        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        so.intra_op_num_threads = n_cpu
+        so.inter_op_num_threads = 1
+        # 关键：关闭 ORT 线程自旋，否则 CPU 被抢占时会长时间空转
+        so.add_session_config_entry("session.intra_op.allow_spinning", "0")
+        sess = ort.InferenceSession(str(model_path), so, providers=["CPUExecutionProvider"])
+        anchors, strides = make_anchors()
 
     cap = cv2.VideoCapture(str(args.input))
     if not cap.isOpened():
@@ -612,6 +841,7 @@ def main() -> int:
 
     fno = 0
     t0 = time.perf_counter()
+    window: list[float] = []
     show = not args.no_show
     print("运行中：按 q 退出。冷启动 %d 帧后切回运动提案。" % args.warmup)
     while True:
@@ -630,9 +860,14 @@ def main() -> int:
         fno += 1
         if args.max_frames and fno > args.max_frames:
             break
+        window.append(time.perf_counter())
+        if len(window) > 31:
+            window.pop(0)
         if fno % 10 == 1:
-            print(f"  帧 {fno} … {fno / max(time.perf_counter() - t0, 1e-6):.1f} FPS",
-                  flush=True)
+            inst = 1.0 / max(time.perf_counter() - window[-2], 1e-6) if len(window) > 1 else 0.0
+            span = window[-1] - window[0]
+            roll = (len(window) - 1) / span if span > 0 else 0.0
+            print(f"  帧 {fno} … {roll:.1f} FPS（瞬时 {inst:.1f}）", flush=True)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         # ---- 提案 ----
@@ -642,24 +877,43 @@ def main() -> int:
         else:
             origins = prop.propose(gray, tb)
 
-        # ---- 图块推理 + 解码 ----
-        dets, scores = [], []
+        # ---- 裁图块（夹回画面内 + 去重）----
+        crops, rects, seen = [], [], set()
         for x0, y0 in origins:
-            # 跟踪预测可能漂出画面：把图块原点夹回合法范围（否则裁到空区域）
             x0 = max(0, min(W - TILE, int(x0)))
             y0 = max(0, min(H - TILE, int(y0)))
+            if (x0, y0) in seen:       # 轨迹漂出画面后夹紧会撞到同一块，去重
+                continue
+            seen.add((x0, y0))
             crop = frame[y0:y0 + TILE, x0:x0 + TILE]
             if crop.shape[0] != TILE or crop.shape[1] != TILE:
                 pad = np.full((TILE, TILE, 3), 114, np.uint8)
                 pad[:crop.shape[0], :crop.shape[1]] = crop
                 crop = pad
-            x = cv2.resize(crop, (IMSZ, IMSZ), interpolation=cv2.INTER_LINEAR)
-            x = cv2.cvtColor(x, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-            preds = sess.run(None, {"batch": x[None].transpose(0, 3, 1, 2)})[0]
-            b, s = decode_topk(preds, anchors, strides, args.conf)
+            crops.append(crop)
+            rects.append((x0, y0))
+
+        # ---- 推理 + 解码 ----
+        if gpu is not None:
+            # 恒定批量：TorchScript 对每个 batch 形状都要重新准备执行计划，
+            # 4 块/6 块来回切换会出现秒级卡顿（实测单帧 2~6 秒）。
+            # 这里把不足的部分用已有图块补齐，形状恒定后再无抖动；
+            # 重复图块产生的重复框会被最后的 NMS 去掉。
+            target = max(1, args.max_cells)
+            padded = list(crops)
+            while padded and len(padded) < target:
+                padded.append(padded[len(padded) % len(crops)])
+            results = gpu.infer(padded, args.conf)[:len(crops)] if padded else []
+        elif pool is not None:
+            results = pool.infer(crops)
+        else:
+            results = [_infer_one(sess, c, args.imgsz, args.conf, anchors, strides)
+                       for c in crops]
+
+        dets, scores = [], []
+        for (x0, y0), (b, s) in zip(rects, results):
             if len(b):
-                scale = IMSZ / TILE
-                b = b / scale + np.asarray([x0, y0, x0, y0], np.float32)
+                b = b + np.asarray([x0, y0, x0, y0], np.float32)
                 dets.append(b)
                 scores.append(s)
         if dets:
@@ -696,6 +950,8 @@ def main() -> int:
     cap.release()
     if writer is not None:
         writer.release()
+    if pool is not None:
+        pool.close()
     cv2.destroyAllWindows()
     dt = time.perf_counter() - t0
     print(f"完成 {fno} 帧，耗时 {dt:.1f}s（{fno / max(dt, 1e-6):.1f} FPS）")

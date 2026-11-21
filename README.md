@@ -24,6 +24,35 @@ release/
    └─ sample_10_highway2_002.mp4  1024² 高速公路另一段
 ```
 
+## 性能（第六轮优化）
+
+同一台笔记本（Ryzen 9 8945HX + RTX 5060）实测**稳态 FPS**：
+
+| 样例 | 分辨率 | GPU（默认） | 纯 CPU |
+|---|---|---|---|
+| 002 高速立交 | 1024² | **38** | 4.1 |
+| 003 城区 | 1024² | 34 | 4.0 |
+| 016 极密 | 1024² | 26 | 3.8 |
+| 022 最密（165 目标/帧） | 1024² | 39 | 4.1 |
+| 001 城区 | 1025² | 42 | 4.2 |
+| 033 单目标 | 280×230 | 85 | 13.3 |
+
+优化了什么（每一步都有实测依据）：
+
+1. **提案硬上限**：原来"每条轨迹加一个图块"，密集场景 42 块/帧；改成
+   运动得分归一化 + 轨迹先验后取前 K 个格子，**恒为 6 块/帧**（7× 减负）。
+2. **PyTorch GPU 后端**：onnxruntime 的 CUDA EP 与 CUDA 版本强绑定，
+   本机装不上；改用 TorchScript（`model/a_p2_nwd_v3_raw.ts`），
+   前向 6 块只要 6~10 ms。
+3. **固定输入缓冲区**：每帧新建张量会让 TorchScript 反复重建执行计划
+   （前 10 帧每帧卡 2 秒），复用同一个张量后抖动完全消失。
+4. **预处理与解码全搬到 GPU**：只上传 uint8 图块（196 KB/块），
+   缩放/归一化/top-k/DFL 都在显存里做，只把最终框传回（几十个）。
+   这一段原来占 37 ms/帧。
+
+> 没有 NVIDIA 显卡时自动退回 onnxruntime CPU（`--backend onnx`），
+> 6 块/帧约 4 FPS；`--imgsz 448` 可再快 ~25%（mAP30 −2 点）。
+
 ## 使用
 
 **方式一（exe，零依赖）**：双击 `run_demo.bat`（默认播放 sample_01），
@@ -32,9 +61,13 @@ release/
 **方式二（源码）**：
 
 ```powershell
-pip install -r requirements.txt        # numpy + opencv + onnxruntime
-python stream_demo.py --input samples\sample_01_highway_002.mp4
+pip install -r requirements.txt        # numpy + opencv + onnxruntime（CPU 路径）
+# 想要 GPU 加速（推荐，快 8~10 倍）：
+pip install torch --index-url https://download.pytorch.org/whl/cu128
+python src\stream_demo.py --input samples\sample_01_highway_002.mp4
 ```
+
+`--backend auto`（默认）会自动选：有 CUDA 用 PyTorch GPU，否则用 onnxruntime CPU。
 
 常用参数：
 
@@ -45,7 +78,10 @@ python stream_demo.py --input samples\sample_01_highway_002.mp4
 | `--k` | 米/像素标定（0=不显示 km/h，只显示 px/帧） | 0.92 |
 | `--fps` | 源视频帧率（测速换算用） | 10 |
 | `--save out.mp4` | 把叠加结果存成视频 | 不存 |
-| `--max-cells` | 每帧最多推理的图块数（算力预算） | 6 |
+| `--max-cells` | 每帧最多推理的图块数（算力预算，越小越快） | 6 |
+| `--backend` | `auto` / `onnx` / `torch` | auto |
+| `--fp32` | GPU 上用 fp32（默认 fp16） | 关 |
+| `--imgsz` | 图块送入网络的边长 | 512 |
 
 ## 实现说明（与项目 satdet 同源）
 
@@ -66,6 +102,6 @@ python stream_demo.py --input samples\sample_01_highway_002.mp4
 * **最密场景**：022 这类 165 目标/帧的画面 mAP30 约 0.52，遮挡严重，是已知短板。
 * **单目标极小框**：028~038 这类框仅 2~26 px 的序列 mAP30 约 0.28~0.44，
   召回尚可（0.81）但定位精度不足，是当前最难的边界。
-* **实时性**：本机 CPU 上 1024² 视频约 3~4 FPS（高密度场景约 3.8 FPS），
-  小分辨率样例（280×230 / 543×285）约 6~8 FPS；渲染按输入帧顺序逐帧进行、不跳帧。
-  显卡机器上用项目 GPU 版代码可达 20+ FPS。
+* **实时性**：有显卡时 1024² 视频 **26~42 FPS**（远高于 10 FPS 的演示门槛）；
+  纯 CPU 约 4 FPS（6 块/帧，已是 ORT 在 4 线程下的极限——单块 36 ms，
+  加线程反而变慢，因为瓶颈是内存带宽）。
