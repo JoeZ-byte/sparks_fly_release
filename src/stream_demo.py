@@ -428,6 +428,11 @@ class MotionProposer:
         self.thr, self.max_cells, self.alpha = thr, max_cells, alpha
         self.bg = None
         self.kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        # 每格上次被检查的帧号：没看过的格子自动加分，保证全场轮转覆盖
+        ny = max(1, int(math.ceil(height / TILE)))
+        nx = max(1, int(math.ceil(width / TILE)))
+        self.last_seen = np.zeros((ny, nx), np.float32)
+        self.frame = 0
 
     def _mask(self, gray: np.ndarray) -> np.ndarray:
         """运动掩膜。半分辨率计算：格子只用来投票，不需要全分辨率精度。"""
@@ -465,11 +470,18 @@ class MotionProposer:
             cx = int(np.clip((b[0] + b[2]) * 0.5, 0, self.w - 1)) // TILE
             cy = int(np.clip((b[1] + b[3]) * 0.5, 0, self.h - 1)) // TILE
             scores[cy, cx] += track_bonus
+        # 陈旧度：越久没检查的格子分越高（8 帧封顶），保证全画面轮转覆盖。
+        # 这是"边缘漏检"的主因修复：边缘格子运动少，原来永远排不进 top-K。
+        self.frame += 1
+        stale = np.clip((self.frame - self.last_seen) / 8.0, 0.0, 1.5)
+        scores = scores + 0.9 * stale
         flat = scores.ravel()
         k = min(self.max_cells, flat.size)
         order = np.argsort(-flat)[:k]
         nx = scores.shape[1]
-        picked = [(int(i) % nx * TILE, int(i) // nx * TILE) for i in order if flat[i] > 0]
+        picked = [(int(i) % nx * TILE, int(i) // nx * TILE) for i in order]
+        for i in order:
+            self.last_seen[int(i) // nx, int(i) % nx] = self.frame
         self.update_bg(gray)          # 背景统一在半分辨率上推进
         return np.asarray(picked, np.int32).reshape(-1, 2)
 
@@ -719,7 +731,7 @@ class SpeedEstimator:
 # 6. 主流程
 # =====================================================================
 def draw(frame: np.ndarray, spd: dict, k: float, fps: float,
-         max_labels: int = 60) -> np.ndarray:
+         max_labels: int = 60, scale: float = 1.0) -> np.ndarray:
     """画框 + 标签。密集场景（>max_labels）只画框不写标签，省一半绘制耗时。"""
     if len(spd) > max_labels:
         spd = dict(sorted(spd.items(), key=lambda kv: -kv[1]["px"])[:max_labels])
@@ -727,7 +739,7 @@ def draw(frame: np.ndarray, spd: dict, k: float, fps: float,
     else:
         labels = True
     for tid, s in sorted(spd.items(), key=lambda kv: -kv[1]["px"]):
-        x1, y1, x2, y2 = (int(round(v)) for v in s["box"])
+        x1, y1, x2, y2 = (int(round(v * scale)) for v in s["box"])
         px = s["px"]
         # 静止门限：连续低速目标不显示（交通流只关心在动的车）
         if px < 0.2:
@@ -804,7 +816,7 @@ def main() -> int:
                     help="CPU 用 INT8 量化模型（约 2.3 倍提速，精度不降）")
     ap.add_argument("--save", default="", help="保存叠加结果视频（可选）")
     ap.add_argument("--csv", default="", help="把逐帧结果写成 CSV（评测用）")
-    ap.add_argument("--display-scale", type=float, default=1.0)
+    ap.add_argument("--display-scale", type=float, default=0.7)
     ap.add_argument("--no-show", action="store_true", help="不弹窗口（批量/无显示环境）")
     ap.add_argument("--max-frames", type=int, default=0, help="只处理前 N 帧（0=全部）")
     ap.add_argument("--loop", action="store_true", help="循环播放（演示用）")
@@ -914,6 +926,7 @@ def main() -> int:
     fno = 0
     t0 = time.perf_counter()
     window: list[float] = []
+    win_ready = False
     show = not args.no_show
     print("运行中：按 q 退出。冷启动 %d 帧后切回运动提案。" % args.warmup)
     while True:
@@ -934,10 +947,10 @@ def main() -> int:
             break
         window.append(time.perf_counter())
         # ---- 自适应图块预算：按最近 10 帧的实际帧率调 K ----
-        if args.auto_tiles and fno % 10 == 0 and len(window) >= 11:
-            span = window[-1] - window[-11]
-            fps_now = 10.0 / span if span > 0 else 0.0
-            if fps_now < target_fps * 0.9 and prop.max_cells > args.min_cells:
+        if args.auto_tiles and fno % 20 == 0 and len(window) >= 21:
+            span = window[-1] - window[-21]
+            fps_now = 20.0 / span if span > 0 else 0.0
+            if fps_now < target_fps * 0.8 and prop.max_cells > args.min_cells:
                 prop.max_cells -= 1
                 warm_grid = prop.warmup_grid()
                 print(f"  [自动] {fps_now:.1f} FPS 偏低 -> 图块数降到 {prop.max_cells}", flush=True)
@@ -1033,15 +1046,33 @@ def main() -> int:
                 b = st["box"]
                 csv_fh.write(f"{tid},{fno},{b[0]:.2f},{b[1]:.2f},{b[2]:.2f},{b[3]:.2f},"
                              f"{st['px']:.4f},{st.get('conf', 1.0):.4f}\n")
-        frame = draw(frame, spd, args.k, args.fps)
-
-        if args.display_scale != 1.0:
-            disp = cv2.resize(frame, None, fx=args.display_scale,
-                              fy=args.display_scale, interpolation=cv2.INTER_NEAREST)
+        # 显示用缩略图（先缩放再画框：省掉全分辨率绘制 + 一次缩放）
+        sc = args.display_scale
+        if writer is None and sc != 1.0:
+            disp = cv2.resize(frame, None, fx=sc, fy=sc,
+                             interpolation=cv2.INTER_AREA)
+            draw(disp, spd, args.k, args.fps, scale=sc)
         else:
-            disp = frame
+            frame = draw(frame, spd, args.k, args.fps)
+            disp = (frame if sc == 1.0 else
+                    cv2.resize(frame, None, fx=sc, fy=sc,
+                               interpolation=cv2.INTER_NEAREST))
+
+        # 左上角叠加实时帧率 / 后端 / 图块数（现场演示自证）
+        if len(window) > 2:
+            span = window[-1] - window[-2]
+            fps_show = 1.0 / span if span > 0 else 0.0
+            tag = "GPU" if gpu is not None else "CPU"
+            info = f"{fps_show:4.1f} FPS  {tag}  tiles={len(crops)}"
+            cv2.rectangle(disp, (0, 0), (300, 26), (0, 0, 0), -1)
+            cv2.putText(disp, info, (6, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                        (0, 255, 255), 2, cv2.LINE_AA)
         if show:
             try:
+                if not win_ready:
+                    # WINDOW_AUTOSIZE + 与图像同尺寸：避免 imshow 每帧内部缩放
+                    cv2.namedWindow("satstream", cv2.WINDOW_AUTOSIZE)
+                    win_ready = True
                 cv2.imshow("satstream", disp)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
