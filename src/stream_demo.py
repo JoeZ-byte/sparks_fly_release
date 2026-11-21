@@ -567,6 +567,7 @@ def main() -> int:
     ap.add_argument("--display-scale", type=float, default=1.0)
     ap.add_argument("--no-show", action="store_true", help="不弹窗口（批量/无显示环境）")
     ap.add_argument("--max-frames", type=int, default=0, help="只处理前 N 帧（0=全部）")
+    ap.add_argument("--loop", action="store_true", help="循环播放（演示用）")
     args = ap.parse_args()
 
     if getattr(sys, "frozen", False):
@@ -616,6 +617,15 @@ def main() -> int:
     while True:
         ok, frame = cap.read()
         if not ok:
+            if args.loop:                      # 演示模式：播完回到第一帧继续
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                prop = MotionProposer(W, H, thr=40.0, max_cells=args.max_cells)
+                tracker = Tracker()
+                speed = SpeedEstimator(args.k, args.fps)
+                warm_grid = prop.warmup_grid()
+                fno = 0
+                t0 = time.perf_counter()
+                continue
             break
         fno += 1
         if args.max_frames and fno > args.max_frames:
