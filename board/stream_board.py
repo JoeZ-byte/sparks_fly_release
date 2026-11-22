@@ -968,7 +968,7 @@ class AsyncDetector:
 def main() -> int:
     ap = argparse.ArgumentParser(description="卫星视频车辆流式识别（单文件版）")
     ap.add_argument("--input", required=True, help="输入视频或图片序列目录")
-    ap.add_argument("--model", default="model/a_p2_nwd_v3_raw_fp32.onnx")
+    ap.add_argument("--model", default="model/a_p2_nwd_arm320_raw_fp32.onnx")
     ap.add_argument("--conf", type=float, default=0.35)
     ap.add_argument("--k", type=float, default=0.92, help="米/像素（0=未标定，只显示 px/帧）")
     ap.add_argument("--fps", type=float, default=10.0, help="源视频帧率（测速用）")
@@ -986,7 +986,7 @@ def main() -> int:
                     help="GPU 后端用的 TorchScript 权重")
     ap.add_argument("--workers", type=int, default=1,
                     help="推理进程数（默认 1；实测多进程在 CPU 上无收益）")
-    ap.add_argument("--imgsz", type=int, default=0,
+    ap.add_argument("--imgsz", type=int, default=320,
                     help="图块送入网络的边长（384 更快、精度略降）")
     ap.add_argument("--threads", type=int, default=4,
                     help="ORT 线程数（8 是实测甜点；再开因内存带宽反而变慢）")
