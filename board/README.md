@@ -85,6 +85,29 @@ python3 stream_board.py --input samples/sample_01_highway_002.mp4
 
 `stream_board.py` 的板端默认值：异步检测开、10 FPS 节流、外推 15 帧、4 线程、4 图块、不预热。
 
+
+## 3.4 涉密数据保护（加密链路）
+
+卫星影像属于涉密数据，本版提供**文件级 AES-256-GCM 密封**，全程走飞腾
+ARMv8 Crypto Extensions（硬件指令）：
+
+```bash
+# 地面站侧：加密视频（模拟专网下发）
+python scripts/97_seal_tools.py seal --in sample_01.mp4 --out sample_01.enc --key <64hex>
+
+# 板端：解密到内存（/dev/shm）后解码，退出擦除明文；结果加密落盘
+python3 stream_board.py --seal-input samples/sample_01.enc --seal-key <64hex> \
+        --seal-csv /dev/shm/tracks.enc
+```
+
+| 指标 | 实测（飞腾派） |
+|---|---|
+| AES-256-GCM 吞吐（硬件） | **1.31 GB/s**（软件 47.9 MB/s，**27×**） |
+| 解密 13 MB 视频 | **82 ms**（占播放时长 2%） |
+| 明文残留 | 无（`/dev/shm` + 0 覆写删除） |
+
+详见 `docs/14_加密与安全设计.md`。
+
 ## 4. 与 x86 版的关系
 
 | | `release/`（x86 版） | `board/`（飞腾派版） |

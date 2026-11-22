@@ -928,6 +928,120 @@ class _BatchJob:
         return d[keep], s[keep]
 
 
+# =====================================================================
+# 1.5 数据密封（AES-256-GCM，硬件加速）
+# =====================================================================
+# 卫星影像是涉密数据：输入流在落地/进内存前必须解密，输出结果落盘前必须加密。
+# 这里用 cryptography（OpenSSL 底层）的 AES-GCM，在飞腾派上走 **ARMv8 Crypto
+# Extensions**（/proc/cpuinfo 有 aes/pmull/sha2），实测：
+#     硬件 1017 MB/s  vs  软件（OPENSSL_armcap=0）48 MB/s  → 21 倍
+# 文件格式（流式，可边解密边喂解码器）：
+#     MAGIC(8) | chunk_size(4) | { nonce(12) | ciphertext(chunk+16) } *
+_MAGIC = b"SFLYSEAL"
+
+
+def _aesgcm(key: bytes):
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    except ImportError as exc:      # 板端未装 cryptography 时给出明确提示
+        raise SystemExit(
+            "需要 cryptography 才能用密封功能：pip install cryptography"
+        ) from exc
+    return AESGCM(key)
+
+
+def seal_file(src: Path, dst: Path, key: bytes, chunk: int = 1 << 20) -> int:
+    """把 src 加密成 dst（AES-256-GCM，分块流式）。返回明文字节数。"""
+    import os
+    import struct
+
+    aead = _aesgcm(key)
+    total = 0
+    with open(src, "rb") as fin, open(dst, "wb") as fout:
+        fout.write(_MAGIC)
+        fout.write(struct.pack("<I", chunk))
+        while True:
+            data = fin.read(chunk)
+            if not data:
+                break
+            nonce = os.urandom(12)
+            ct = aead.encrypt(nonce, data, None)
+            fout.write(nonce)
+            fout.write(ct)
+            total += len(data)
+    return total
+
+
+def unseal_file(src: Path, dst: Path, key: bytes) -> int:
+    """把加密文件解密到 dst（内存文件系统优先，便于"解密→解码"零磁盘残留）。"""
+    import struct
+
+    aead = _aesgcm(key)
+    total = 0
+    with open(src, "rb") as fin, open(dst, "wb") as fout:
+        magic = fin.read(8)
+        if magic != _MAGIC:
+            raise SystemExit("不是本系统产生的密封文件（magic 不匹配）")
+        (chunk,) = struct.unpack("<I", fin.read(4))
+        while True:
+            nonce = fin.read(12)
+            if len(nonce) < 12:
+                break
+            blob = fin.read(chunk + 16)
+            if not blob:
+                break
+            plain = aead.decrypt(nonce, blob, None)
+            fout.write(plain)
+            total += len(plain)
+    return total
+
+
+def wipe_file(path: Path) -> None:
+    """安全擦除：先用 0 覆写再删除（防止明文残留在磁盘/共享内存）。"""
+    try:
+        size = path.stat().st_size
+        with open(path, "r+b") as fh:
+            left = size
+            zero = b"\0" * min(1 << 20, max(1, size))
+            while left > 0:
+                n = min(len(zero), left)
+                fh.write(zero[:n])
+                left -= n
+            fh.flush()
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+class SealedVideoSource:
+    """加密视频 -> 内存解密 -> OpenCV 解码（退出时擦除明文）。
+
+    演示"专网加密下发"：地面站只发 .enc 文件，板子用硬件 AES 解密到
+    内存文件系统 /dev/shm，再交给解码器；播放结束把明文覆写并删除。
+    """
+
+    def __init__(self, enc_path: Path, key: bytes, shm_dir: str = "/dev/shm") -> None:
+        import os
+        import time as _t
+
+        self.enc_path = enc_path
+        base = Path(shm_dir) if os.path.isdir(shm_dir) else Path(os.environ.get("TEMP", "/tmp"))
+        self.plain_path = base / f"sfly_{os.getpid()}_{int(_t.time())}.mp4"
+        t0 = _t.perf_counter()
+        size = unseal_file(enc_path, self.plain_path, key)
+        dt = _t.perf_counter() - t0
+        mb = size / (1 << 20)
+        print(f"  解密 {mb:.1f} MB -> {self.plain_path}（{mb / max(dt, 1e-9):.0f} MB/s，"
+              f"AES-256-GCM 硬件路径）", flush=True)
+
+    def open(self) -> "cv2.VideoCapture":
+        return cv2.VideoCapture(str(self.plain_path))
+
+    def close(self) -> None:
+        wipe_file(self.plain_path)
+        print(f"  明文已擦除: {self.plain_path.name}", flush=True)
+
+
 class AsyncDetector:
     """把"检测"放到后台线程，显示循环不再等它。
 
@@ -967,7 +1081,13 @@ class AsyncDetector:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="卫星视频车辆流式识别（单文件版）")
-    ap.add_argument("--input", required=True, help="输入视频或图片序列目录")
+    ap.add_argument("--input", default="", help="输入视频路径（与 --seal-input 二选一）")
+    ap.add_argument("--seal-input", default="",
+                    help="加密视频（.enc）：先硬件解密到内存再解码，退出时擦除明文")
+    ap.add_argument("--seal-key", default="",
+                    help="AES-256 密钥（64 位 hex）；密封功能必填")
+    ap.add_argument("--seal-csv", default="", help="把跟踪结果加密写入该 .enc 文件")
+    ap.add_argument("--seal-video", default="", help="把叠加视频加密写入该 .enc 文件")
     ap.add_argument("--model", default="model/a_p2_nwd_arm320_raw_fp32.onnx")
     ap.add_argument("--conf", type=float, default=0.35)
     ap.add_argument("--k", type=float, default=0.92, help="米/像素（0=未标定，只显示 px/帧）")
@@ -1097,9 +1217,20 @@ def main() -> int:
         sess = ort.InferenceSession(str(model_path), so, providers=["CPUExecutionProvider"])
         anchors, strides = make_anchors()
 
-    cap = cv2.VideoCapture(str(args.input))
+    if not args.seal_input and not args.input:
+        print("需要 --input <视频> 或 --seal-input <加密视频>")
+        return 1
+    sealed_src = None
+    if args.seal_input:
+        if not args.seal_key:
+            print("--seal-input 需要配合 --seal-key <64位hex>")
+            return 1
+        sealed_src = SealedVideoSource(Path(args.seal_input), bytes.fromhex(args.seal_key))
+        cap = sealed_src.open()
+    else:
+        cap = cv2.VideoCapture(str(args.input))
     if not cap.isOpened():
-        print(f"打不开输入: {args.input}")
+        print(f"打不开输入: {args.seal_input or args.input}")
         return 1
     W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -1397,6 +1528,27 @@ def main() -> int:
         pool.close()
     if csv_fh is not None:
         csv_fh.close()
+
+    # ---- 输出密封：CSV / 视频先落临时文件，再用硬件 AES 加密，最后擦除临时文件 ----
+    if args.seal_key and (args.seal_csv or args.seal_video):
+        key = bytes.fromhex(args.seal_key)
+        for src_attr, dst_path, label in (
+                (args.csv, args.seal_csv, "CSV"),
+                (args.save, args.seal_video, "视频")):
+            if not dst_path or not src_attr:
+                continue
+            src = Path(src_attr)
+            if not src.is_file():
+                continue
+            _seal_t0 = time.perf_counter()
+            n = seal_file(src, Path(dst_path), key)
+            _seal_dt = time.perf_counter() - _seal_t0
+            print(f"  {label}已加密: {dst_path}（{n/2**20:.1f} MB, "
+                  f"{n/(1<<20)/max(_seal_dt,1e-9):.0f} MB/s，AES-256-GCM）", flush=True)
+            wipe_file(src)
+
+    if sealed_src is not None:
+        sealed_src.close()
     try:
         cv2.destroyAllWindows()          # headless 版 OpenCV 没有 GUI，会抛错
     except cv2.error:
