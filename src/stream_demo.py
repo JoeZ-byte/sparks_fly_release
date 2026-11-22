@@ -572,8 +572,9 @@ class _Track:
 
 class Tracker:
     def __init__(self, min_hits: int = 3, max_age: int = 15,
-                 gate_norm_max: float = 1.0):
+                 gate_norm_max: float = 1.0, display_coast: int = 2):
         self.min_hits, self.max_age, self.gate = min_hits, max_age, gate_norm_max
+        self.display_coast = display_coast
         self.tracks: list[_Track] = []
         self.dead: list[tuple] = []
         self.next_id = 1
@@ -680,7 +681,8 @@ class Tracker:
         self.dead = [d for d in self.dead if self.frame - d[4] <= 12][-64:]
         # 输出所有已确认轨迹：tsu<=3 允许短时外推（车辆被遮挡/本帧没覆盖到的格子时
         # 仍按卡尔曼预测显示，播放时不会"闪没"；超过 3 帧才隐藏，避免幽灵框）。
-        return [t for t in self.tracks if t.pid is not None and t.tsu <= 2]
+        return [t for t in self.tracks if t.pid is not None
+                and t.tsu <= self.display_coast]
 
     def _revive(self, box: np.ndarray, score: float) -> bool:
         if not self.dead:
@@ -880,6 +882,73 @@ def prewarm_lookback(cap, prop, pool, sess, gpu, anchors, strides, args,
     return frames, first_ids
 
 
+class _BatchJob:
+    """在后台线程里跑一次"预处理 + 推理 + 解码 + NMS"，返回 (boxes, scores)。"""
+
+    def __init__(self, crops, rects, args, anchors, strides, gpu, sess):
+        self.crops, self.rects, self.args = crops, rects, args
+        self.anchors, self.strides = anchors, strides
+        self.gpu, self.sess = gpu, sess
+
+    def __call__(self):
+        a = self.args
+        if self.gpu is not None:
+            res = self.gpu.infer(self.crops, a.conf)
+        elif self.sess is not None:
+            res = _infer_batch(self.sess, self.crops, a.imgsz, a.conf,
+                               self.anchors, self.strides)
+        else:
+            res = []
+        dets, scores = [], []
+        for (x0, y0), (b, s) in zip(self.rects, res):
+            if len(b):
+                dets.append(b + np.asarray([x0, y0, x0, y0], np.float32))
+                scores.append(s)
+        if not dets:
+            return np.zeros((0, 4), np.float32), np.zeros(0, np.float32)
+        d = np.concatenate(dets)
+        s = np.concatenate(scores)
+        keep = nms(d, s, 0.5)
+        return d[keep], s[keep]
+
+
+class AsyncDetector:
+    """把"检测"放到后台线程，显示循环不再等它。
+
+    飞腾派上单帧检测要 300~1000 ms，同步跑的话显示帧率就是检测帧率（1~3 FPS）。
+    用异步后：显示维持 10+ FPS（靠卡尔曼外推），检测以自己能跑的速度持续更新。
+    """
+
+    def __init__(self, fn) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        self._pool = ThreadPoolExecutor(max_workers=1)
+        self._fn = fn
+        self._future = None
+
+    @property
+    def busy(self) -> bool:
+        return self._future is not None
+
+    def submit(self, job) -> bool:
+        if self._future is not None:
+            return False                      # 上一帧还没算完，本帧跳过检测
+        self._future = self._pool.submit(self._fn, job)
+        return True
+
+    def poll(self):
+        if self._future is None or not self._future.done():
+            return None
+        fut, self._future = self._future, None
+        try:
+            return fut.result()
+        except Exception:
+            return None
+
+    def close(self) -> None:
+        self._pool.shutdown(wait=False, cancel_futures=True)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="卫星视频车辆流式识别（单文件版）")
     ap.add_argument("--input", required=True, help="输入视频或图片序列目录")
@@ -905,9 +974,17 @@ def main() -> int:
                     help="图块送入网络的边长（384 更快、精度略降）")
     ap.add_argument("--threads", type=int, default=5,
                     help="ORT 线程数（8 是实测甜点；再开因内存带宽反而变慢）")
+    ap.add_argument("--max-coast", type=int, default=2,
+                    help="未更新轨迹最多外推显示多少帧（板端检测慢时应调大，如 15）")
+    ap.add_argument("--play-fps", type=float, default=0.0,
+                    help="显示节流目标帧率（0=不限速；异步模式建议设成视频帧率）")
+    ap.add_argument("--async-detect", action=argparse.BooleanOptionalAction,
+                    default=False,
+                    help="检测放后台线程，显示用卡尔曼外推（慢机器上显著提升观感）")
     ap.add_argument("--det-every", type=int, default=1,
                     help="检测周期：N 表示每 N 帧检测一次（>1 会明显掉召回，仅供极限提速）")
-    ap.add_argument("--auto-tiles", action="store_true", default=True,
+    ap.add_argument("--auto-tiles", action=argparse.BooleanOptionalAction,
+                    default=True,
                     help="按实测帧率自动调整每帧图块数（默认开）")
     ap.add_argument("--target-fps", type=float, default=0.0,
                     help="自适应目标帧率（0=自动：GPU 25、CPU 12）")
@@ -1011,7 +1088,7 @@ def main() -> int:
     W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     prop = MotionProposer(W, H, thr=40.0, max_cells=args.max_cells)
-    tracker = Tracker()
+    tracker = Tracker(display_coast=args.max_coast)
     speed = SpeedEstimator(args.k, args.fps)
     warm_grid = prop.warmup_grid()
 
@@ -1054,13 +1131,17 @@ def main() -> int:
         prop = MotionProposer(W, H, thr=40.0, max_cells=prop.max_cells)
         speed = SpeedEstimator(args.k, args.fps)
         warm_grid = prop.warmup_grid()
-        full_grid = prop.warmup_grid(stride=1)      # 全网格：开播头几帧认领所有播种轨迹
+        pace_fps = args.play_fps if args.play_fps > 0 else (args.fps if args.async_detect else 0.0)
+    full_grid = prop.warmup_grid(stride=1)      # 全网格：开播头几帧认领所有播种轨迹
 
+    pace_fps = args.play_fps if args.play_fps > 0 else (args.fps if args.async_detect else 0.0)
     full_grid = prop.warmup_grid(stride=1)
     full_claim = 0
     # 有回溯时不走冷启动网格：播种轨迹本身就是"车辆在哪"的先验，
     # 再用 4 格稀疏网格会在第 8~15 帧出现明显空窗（实测框数从 44 掉到 6）。
     warm_frames = 0 if args.prewarm > 0 else args.warmup
+    async_det = AsyncDetector(lambda job: job()) if args.async_detect else None
+    det_times: list[float] = []
     fno = 0
     t0 = time.perf_counter()
     window: list[float] = []
@@ -1084,8 +1165,14 @@ def main() -> int:
         if args.max_frames and fno > args.max_frames:
             break
         window.append(time.perf_counter())
+        if pace_fps > 0:
+            _due = t0 + fno / pace_fps
+            _lag = _due - time.perf_counter()
+            if _lag > 0:
+                time.sleep(_lag)
         # ---- 自适应图块预算：按最近 10 帧的实际帧率调 K ----
-        if args.auto_tiles and fno % 20 == 0 and len(window) >= 21:
+        if (args.auto_tiles and async_det is None
+                and fno % 20 == 0 and len(window) >= 21):
             span = window[-1] - window[-21]
             fps_now = 20.0 / span if span > 0 else 0.0
             if fps_now < target_fps * 0.8 and prop.max_cells > args.min_cells:
@@ -1102,7 +1189,9 @@ def main() -> int:
             inst = 1.0 / max(time.perf_counter() - window[-2], 1e-6) if len(window) > 1 else 0.0
             span = window[-1] - window[0]
             roll = (len(window) - 1) / span if span > 0 else 0.0
-            print(f"  帧 {fno} … {roll:.1f} FPS（瞬时 {inst:.1f}）", flush=True)
+            det_fps = (len(det_times) - 1) / (det_times[-1] - det_times[0]) if len(det_times) > 1 else 0.0
+            print(f"  帧 {fno} … 显示 {roll:.1f} FPS（瞬时 {inst:.1f}）  检测 {det_fps:.2f} 次/秒",
+                  flush=True)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         # ---- 检测周期化：非检测帧只外推，不推理 ----
@@ -1145,6 +1234,57 @@ def main() -> int:
                 crop = pad
             crops.append(crop)
             rects.append((x0, y0))
+
+        # ---- 异步检测：本帧只提交，结果稍后合并 ----
+        if async_det is not None:
+            det_res = async_det.poll()
+            if det_res is not None:
+                det_times.append(time.perf_counter())
+                if len(det_times) > 10:
+                    det_times.pop(0)
+                d, s = det_res
+                tracks = tracker.update(d, s)
+                spd = speed.update(tracks, fno)
+            else:
+                tracks = tracker.coast()
+                spd = speed.update(tracks, fno)
+            if async_det.busy is False:
+                tb = np.asarray([x.box for x in tracker.tracks], np.float32).reshape(-1, 4)
+                origins = (warm_grid if fno <= warm_frames else
+                           prop.propose(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), tb))
+                crops, rects, seen = [], [], set()
+                for x0, y0 in origins:
+                    x0 = max(0, min(W - TILE, int(x0)))
+                    y0 = max(0, min(H - TILE, int(y0)))
+                    if (x0, y0) in seen:
+                        continue
+                    seen.add((x0, y0))
+                    c = frame[y0:y0 + TILE, x0:x0 + TILE]
+                    if c.shape[0] != TILE or c.shape[1] != TILE:
+                        pad = np.full((TILE, TILE, 3), 114, np.uint8)
+                        pad[:c.shape[0], :c.shape[1]] = c
+                        c = pad
+                    crops.append(c)
+                    rects.append((x0, y0))
+                async_det.submit(_BatchJob(crops, rects, args, anchors, strides, gpu, sess))
+            if writer is not None:
+                writer.write(draw(frame, spd, args.k, args.fps))
+            if show:
+                try:
+                    if not win_ready:
+                        cv2.namedWindow("satstream", cv2.WINDOW_AUTOSIZE)
+                        win_ready = True
+                    cv2.imshow("satstream", frame)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        break
+                except cv2.error:
+                    show = False
+            if csv_fh is not None:
+                for tid, st in spd.items():
+                    b = st["box"]
+                    csv_fh.write(f"{tid},{fno},{b[0]:.2f},{b[1]:.2f},{b[2]:.2f},{b[3]:.2f},"
+                                 f"{st['px']:.4f},{st.get('conf', 1.0):.4f}\n")
+            continue
 
         # ---- 推理 + 解码 ----
         _ip0 = time.perf_counter()
@@ -1241,7 +1381,10 @@ def main() -> int:
         pool.close()
     if csv_fh is not None:
         csv_fh.close()
-    cv2.destroyAllWindows()
+    try:
+        cv2.destroyAllWindows()          # headless 版 OpenCV 没有 GUI，会抛错
+    except cv2.error:
+        pass
     dt = time.perf_counter() - t0
     print(f"完成 {fno} 帧，耗时 {dt:.1f}s（{fno / max(dt, 1e-6):.1f} FPS）")
     return 0
