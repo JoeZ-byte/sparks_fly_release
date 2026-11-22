@@ -3,6 +3,23 @@
 > 赛题：**基于飞腾 CPU 的创新应用系统设计**（软件赛道）
 > 本目录是**板端独立的一套**：x86 版在 `release/`，两者核心算法一致、默认参数不同。
 
+
+## 0. 快速开始（含连接）
+
+```powershell
+# PC 侧：一键打通串口 -> 板端 IP -> SSH 免密（USB-TTL 已接好时）
+powershell -ExecutionPolicy Bypass -File scripts\96_board_setup.ps1
+
+# PC 侧：把本目录推到板子并安装依赖（板子无外网，用离线 wheel）
+scp -r board board:~/
+ssh board "cd ~/board && bash install.sh"
+
+# 板端：跑演示
+ssh board "cd ~/board && python3 stream_board.py --input samples/sample_01_highway_002.mp4"
+```
+
+连接细节（接线、串口、IP、排障、重启恢复）见 **`docs/12_飞腾派部署与优化.md`**。
+
 ## 1. 应用场景与创新点（对应赛题要求 1、4）
 
 | 赛题要求 | 本作品的落地 |
