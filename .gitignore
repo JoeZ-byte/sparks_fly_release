@@ -10,3 +10,5 @@ build/
 *.csv
 *.mp4.tmp
 out_*/
+# 测试产物（samples 里的正式样本不受影响）
+out*.mp4
