@@ -1,0 +1,45 @@
+# =====================================================================
+# 基线：整帧 YOLOv8n（P3-P5）+ CIoU + FP32 + 单线程
+# 目的：量化"原始痛点"—— 6 px 目标被缩到 3 px，且整帧推理贵
+# =====================================================================
+exp_id: baseline
+seed: 0
+
+model:
+  nc: 1
+  p2: false              # 官方结构，便于和论文/公开结果对照
+
+pretrained: weights/yolov8n_coco.pt
+freeze_backbone: true
+freeze_upto: 9
+
+data:
+  mode: full             # 整帧 letterbox
+  imgsz: 1024            # 原生分辨率（不再缩小，避免自己制造额外损失）
+  tile: 256
+  train_seqs: ["002", "005", "006", "008"]
+  val_seqs: ["003"]
+  neg_per_frame: 0
+  min_visible: 0.5
+
+loss:
+  box: ciou              # 基线用 CIoU
+  nwd_c: 12.0
+
+train:
+  epochs: 12
+  batch_size: 4          # 1024 输入，8 GB 显存只能小 batch
+  lr: 0.002
+  warmup_iters: 100
+  workers: 4
+  weight_decay: 0.0005
+  grad_clip: 10.0
+  amp: true
+  eval_every: 2
+  log_every: 20
+
+val:
+  proposal: full
+  batch_size: 2
+  nms_iou: 0.5
+  conf_floor: 0.05

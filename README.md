@@ -1,130 +1,98 @@
-# 卫星视频车辆流式识别 —— Release 包
+# 卫星视频车辆检测与测速（x86 / ARM 双平台）
 
-把项目流水线打包成**单文件**，对外 0 依赖：不需要项目代码、不需要数据集、
-不需要配置环境（exe 版连 Python 都不需要）。
+面向卫星与无人机视频的**极小目标（2~26 像素）**车辆实时检测与测速流水线。
+输入一路 1024×1024 视频，输出每帧的车辆框、轨迹 ID 与车速，可直接落到 CSV 或叠加视频。
 
-## 演示材料
-
-| 文件 | 说明 |
-|---|---|
-| `satdet_x86_arm_deck.pptx` | 17 页可视化讲解：同一帧逐步展示五阶段算法状态，x86 / 飞腾派双平台对比 |
-| `satdet_x86_arm_deck.pdf` | 同上的 PDF 版（答辩投影备用） |
-
+- **只算该算的像素**：以运动提案选出每帧至多 6 个 256×256 图块，参与网络的像素量约为全图的 44%。
+- **只跑跑得动的模型**：YOLOv8n + P2 高分辨率分支 + NWD 回归损失，INT8 量化后 3.47 MB。
+- **板端不依赖 Python**：核心链路（图像算子、DFL 解码、NMS、卡尔曼、三级指派、测速、光流先验）用 C/C++ 实现，
+  Python 主程序通过 ctypes 直接链接编译好的加速库；同时保留一份**纯 Python** 实现，便于对照与无编译环境使用。
 
 ## 目录
 
 ```
 release/
-├─ stream_demo.exe        # ★ 单文件可执行程序（PyInstaller，免 Python）
-├─ stream_demo.py         #   同源源码（放 src/，需要 Python 时用）
-├─ run_demo.bat           #   双击运行 / 把视频拖到它上面
-├─ requirements.txt       #   源码版需要的三个基础库
-├─ model/
-│  └─ a_p2_nwd_v3_raw_fp32.onnx        # 我们的 YOLO（YOLOv8n+P2+NWD+ECA，38 段全量，12.2 MB）
-└─ samples/               # 10 段样例视频（VISO 数据集片段，mp4v/10fps）
-   ├─ sample_01_highway_002.mp4   1024² 高速公路立交（效果最好）
-   ├─ sample_02_urban_003.mp4     1024² 城区
-   ├─ sample_03~05_*.mp4          1024² 城区 ×3
-   ├─ sample_06_wide_009.mp4      1024² 目标更大
-   ├─ sample_07_test_010.mp4      1024² 测试段
-   ├─ sample_08_tiny_033.mp4      280×230 单目标·框仅 6~15 px（最难的尺度）
-   ├─ sample_09_tiny_036.mp4      543×285 单目标·框仅 2~7 px
-   └─ sample_10_highway2_002.mp4  1024² 高速公路另一段
+├── README.md              总说明（本文件）
+├── X86/                   x86 平台（512 输入，精度优先）
+│   ├── README.md
+│   ├── config.json        默认模型与流水线参数
+│   ├── stream.py          主程序（--backend native|python）
+│   ├── src/               native_bridge.py（ctypes 绑定）、pipeline_py.py（纯 Python 流水线）
+│   ├── native/            加速库源码 + 预编译库（satstream.dll）
+│   ├── models/            检测模型（ONNX，fp32 + int8）
+│   ├── train/             训练代码与配置（satdet 包 + configs + 预训练权重）
+│   ├── docs/              架构、指标、部署说明
+│   └── samples/           示例视频
+└── ARM/                   ARM 平台（320 输入，实时优先）
+    └── …（同上，models 为 320 系列，native 预编译库为 libsatstream.so）
 ```
 
-## 性能（CPU 为主，GPU 可选）
+## 快速开始
 
-同一台笔记本（Ryzen 9 8945HX 16 核 + RTX 5060）实测**稳态 FPS**，
-CPU 与 GPU 两条路径都开箱即用：
+```bash
+pip install -r requirements.txt            # opencv-python-headless, numpy, onnxruntime
 
-| 样例 | 分辨率 | **CPU（默认）** | GPU（可选） |
-|---|---|---|---|
-| 002 高速立交 | 1024² | **11.5** | 53.0 |
-| 003 城区 | 1024² | 11.2 | 49.3 |
-| 016 极密 | 1024² | 12.7 | 39.1 |
-| 022 最密（165 目标/帧） | 1024² | 11.1 | 44.7 |
-| 024 / 025 | 1024² | 11.4 / 10.2 | 48.0 / 40.7 |
-| 010 | 1024² | 11.3 | 44.1 |
-| 001 | 1025² | 10.2 | 41.8 |
-| 033 单目标 | 280×230 | 28.8 | 66.8 |
-
-**CPU 路径怎么做到的**（每一步都有实测依据）：
-
-1. **INT8 静态量化**（QDQ、per-channel、240 个真实图块校准）：
-   单块 512² 从 35 ms 降到 **17 ms**（2.1×），mAP30 0.8297 → **0.8927**
-   （量化反而去掉了部分噪声，精度没降）。
-2. **提案硬上限**：原来"每条轨迹加一个图块"，密集场景 42 块/帧；
-   改成运动得分归一化 + 轨迹先验后取前 K 个格子，**K≤8 且自适应**。
-3. **自适应图块预算**：每 10 帧按实测帧率调整 K（默认目标 12 FPS，
-   下限 4）。机器快就自动多用图块提精度，机器慢就自动降到 4 保帧率。
-4. **渲染/掩膜优化**：密集场景 150 个目标时，标题文字从每帧 300 次绘制
-   减到 ≤60 个标签（18 ms → 1 ms）；运动掩膜改成半分辨率计算（8 ms → 3 ms）。
-5. **批量推理**：一帧的 K 个图块打包成一次 `sess.run`（INT8 下快约 18%）。
-
-**GPU 路径**（`--backend auto` 检测到 CUDA 才启用）额外做了：TorchScript
-前向 + 固定输入缓冲（避免 JIT 反复重建执行计划导致秒级卡顿）+ 预处理/解码
-全部放在显存里，只回传最终框。
-
-> 没有显卡：什么都不用装，`pip install -r requirements.txt` 就是 CPU 路径。
-> 有显卡想要更高帧率：`pip install torch --index-url https://download.pytorch.org/whl/cu128`。
-
-### 极慢机器上的进一步提速
-
-```powershell
-python src\stream_demo.py --input ... --min-cells 3        # 图块下限降到 3（约 +25% 帧率）
-python src\stream_demo.py --input ... --det-every 2        # 隔帧检测（帧率翻倍，MOTA 0.41 -> 0.21）
-python src\stream_demo.py --input ... --imgsz 448          # 输入降到 448（快 25%，mAP30 -2 点）
+cd X86                                     # 或 cd ARM（板端）
+python stream.py --input samples/sample_01_highway_002.mp4 --csv tracks.csv
+python stream.py --input samples/sample_08_tiny_033.mp4 --backend python --frames 60
 ```
 
-## 使用
-
-**方式一（exe，零依赖）**：双击 `run_demo.bat`（默认播放 sample_01），
-或把任意视频文件拖到 `run_demo.bat` 上。
-
-**方式二（源码）**：
-
-```powershell
-pip install -r requirements.txt        # numpy + opencv + onnxruntime（CPU 路径）
-# 想要 GPU 加速（推荐，快 8~10 倍）：
-pip install torch --index-url https://download.pytorch.org/whl/cu128
-python src\stream_demo.py --input samples\sample_01_highway_002.mp4
-```
-
-`--backend auto`（默认）会自动选：有 CUDA 用 PyTorch GPU，否则用 onnxruntime CPU。
+默认使用加速库（`--backend native`）；若所在平台没有预编译库，可先编译（见各平台 README），
+或直接用 `--backend python` 跑纯 Python 版。
 
 常用参数：
 
-| 参数 | 含义 | 默认 |
-|---|---|---|
-| `--input` | 输入视频 | 必填 |
-| `--conf` | 检测置信度 | 0.35 |
-| `--k` | 米/像素标定（0=不显示 km/h，只显示 px/帧） | 0.92 |
-| `--fps` | 源视频帧率（测速换算用） | 10 |
-| `--save out.mp4` | 把叠加结果存成视频 | 不存 |
-| `--max-cells` | 每帧最多推理的图块数（算力预算，越小越快） | 6 |
-| `--backend` | `auto` / `onnx` / `torch` | auto |
-| `--fp32` | GPU 上用 fp32（默认 fp16） | 关 |
-| `--imgsz` | 图块送入网络的边长 | 512 |
+| 参数 | 说明 |
+|---|---|
+| `--backend native\|python` | native=链接 C/C++ 加速库（默认）；python=纯 Python |
+| `--imgsz 512\|320` | 网络输入边长，需与模型匹配 |
+| `--max-cells 6` | 每帧最多推理的图块数 |
+| `--flow-w 1.0` / `--no-flow` | 光流速度先验权重（**默认开启**） |
+| `--no-tophat` | 关闭提案前的白顶帽增强（默认开启） |
+| `--min-hits 5` `--gate 0.7` | 轨迹确认门槛与关联门限 |
+| `--csv` `--save-video` `--show` | 输出轨迹 CSV / 叠加视频 / 实时窗口 |
 
-## 实现说明（与项目 satdet 同源）
+## 模型一览
 
-* **运动先验**：背景差分（固定阈值 40、闭运算）→ 16 格投票 → 每帧只推理
-  动静最大的 K 块；冷启动前 15 帧全图扫描。
-* **跟踪**：8 态卡尔曼 + 椭圆搜索域 + 匈牙利匹配（内置实现，免 scipy）+
-  暂定态转正（连续 3 帧才发 ID）+ 轨迹复活。
-* **检测**：YOLOv8n+P2+NWD+ECA（**v3 模型**：38 段 / 10.1 万图块 / 84 万实例，
-  含 JPEG 退化增强与 NWD C=8），图块 256→512 放大；只解码高分 anchor。
-* **车速**：6/12/18 帧多滞后中位差分 + EWMA(0.7) + 物理上限与限幅。
-* **静止门限**：连续低速（<0.2 px/帧 ≈ 7 km/h）的目标不显示——交通流
-  只关心在动的车，顺带滤掉原地晃的噪点。
+所有模型均在同一份训练集上训练（37 段序列，验证固定 010），指标为 010 序列的 mAP30。
 
-## 如实说明
+**X86（512 输入）**
 
-* **速度标签**：k=0.92 米/像素是按吉林一号量级标定的（±10%）；换别的卫星/
-  分辨率请用 `--k 0`（只显示 px/帧），否则 km/h 数字不可信。
-* **最密场景**：022 这类 165 目标/帧的画面 mAP30 约 0.52，遮挡严重，是已知短板。
-* **单目标极小框**：028~038 这类框仅 2~26 px 的序列 mAP30 约 0.28~0.44，
-  召回尚可（0.81）但定位精度不足，是当前最难的边界。
-* **实时性**：有显卡时 1024² 视频 **26~42 FPS**（远高于 10 FPS 的演示门槛）；
-  纯 CPU 约 4 FPS（6 块/帧，已是 ORT 在 4 线程下的极限——单块 36 ms，
-  加线程反而变慢，因为瓶颈是内存带宽）。
+| 模型 | 文件 | mAP30 | 说明 |
+|---|---|---|---|
+| **v3（默认）** | `models/a_p2_nwd_v3_raw_int8.onnx` | **0.8474** | 主线模型，精度最高 |
+| v3 fp32 | `models/a_p2_nwd_v3_raw_fp32.onnx` | 0.8474 | 不量化版本，便于二次量化 |
+| full | `models/a_nwd_p2_full_raw_fp32.onnx` | 0.8379 | 同架构早期版本 |
+| full2 | `models/a_nwd_p2_full2_raw_fp32.onnx` | 0.8281 | 同架构另一组采样参数 |
+
+**ARM（320 输入）**
+
+| 模型 | 文件 | mAP30 | 说明 |
+|---|---|---|---|
+| **kd320（默认）** | `models/a_p2_nwd_kd320_raw_int8.onnx` | **0.8104** | 320 输入 + 特征蒸馏 |
+| arm320 | `models/a_p2_nwd_arm320_raw_{fp32,int8}.onnx` | 0.8003 | 320 输入基线 |
+| rep320 | `models/a_p2_nwd_rep320_raw_{fp32,int8}.onnx` | 0.8083 | MobileOne 重参数化训练，推理结构与基线一致 |
+
+> 选型依据：x86 有余量，用 512 输入换精度；板端推理是瓶颈，用 320 输入换帧率。
+> 同一份 320 模型在树莓派 4B 上单图块 98.6 ms、飞腾派 E2000Q 上 130 ms。
+
+## 实测性能
+
+| 平台 | 输入 | 单图块推理 | 同步端到端 | 备注 |
+|---|---|---|---|---|
+| x86（Ryzen 9 8945HX，4 线程） | 512 | 26.5 ms | 5.3 FPS | 6 图块/帧 |
+| 树莓派 4B（4×A72 1.8 GHz） | 320 | 98.6 ms | 1.49 FPS | 默认配置（光流+白顶帽开启） |
+| 飞腾派 E2000Q（4×1.5 GHz） | 320 | 130 ms | 0.95 FPS | 无 int8 点积指令，估算值 |
+
+同步模式下瓶颈全部在推理；若显示端需要流畅，可用异步检测 + 卡尔曼外推（显示 10 fps、检测 1.2~1.6 Hz），
+参数见各平台 docs。
+
+## 文档
+
+- `X86/docs/01_系统架构.md`、`ARM/docs/01_系统架构.md`：五级流水线与各层职责
+- `X86/docs/02_性能与精度.md`、`ARM/docs/02_性能与精度.md`：模型与平台实测数据
+- `X86/docs/03_部署说明.md`、`ARM/docs/03_部署说明.md`：构建、运行与参数
+
+## 许可
+
+本项目代码用于竞赛与学习用途；模型权重基于 VisDrone 数据训练，使用时请遵守原始数据集许可。

@@ -1,0 +1,59 @@
+# =====================================================================
+# v3：38 段全量（解析器修正后 028~038 单目标有效）+ 退化增强 + ECA + NWD C=8
+#   train = 001~009, 011~038（37 段）   val = 010
+#   相对 v2/full2 的改动（对应评审建议）：
+#     1) JPEG 退化增强 q=30~70 + 轻微高斯噪声  —— 训练/推理分布对齐
+#     2) 背景图块占比 1.0 -> 0.35/帧（约 5~7%）
+#     3) NWD 的 C 12 -> 8（6px 目标下更敏感）
+#     4) P2 路径加 ECA 通道注意力（仅 3 个参数）
+# =====================================================================
+exp_id: a_nwd_p2_v3
+seed: 0
+
+model:
+  nc: 1
+  p2: true
+  eca: true
+
+pretrained: weights/yolov8n_coco.pt
+freeze_backbone: true
+freeze_upto: 9
+
+data:
+  mode: tile
+  tile: 256
+  imgsz: 512
+  train_seqs: ["001", "002", "003", "004", "005", "006", "007", "008", "009",
+               "011", "012", "013", "014", "015", "016", "017", "018", "019",
+               "020", "021", "022", "023", "024", "025", "026", "027",
+               "028", "029", "030", "031", "032", "033", "034", "035", "036", "037", "038"]
+  val_seqs: ["010"]
+  neg_per_frame: 0.35
+  min_visible: 0.5
+  degrade:
+    jpeg_prob: 0.5
+    jpeg_q: [30, 70]
+    noise_prob: 0.3
+    noise_sigma: 3.0
+
+loss:
+  box: nwd
+  nwd_c: 8.0
+
+train:
+  epochs: 5
+  batch_size: 16
+  lr: 0.002
+  warmup_iters: 200
+  workers: 6
+  weight_decay: 0.0005
+  grad_clip: 10.0
+  amp: true
+  eval_every: 1
+  log_every: 200
+
+val:
+  proposal: oracle
+  batch_size: 8
+  nms_iou: 0.5
+  conf_floor: 0.05

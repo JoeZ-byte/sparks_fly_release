@@ -1,0 +1,46 @@
+# =====================================================================
+# A 组：精度"够用"的最小成本配置
+#   图块 256 -> 上采样 512 | P2 检测头 | NWD Loss | 冻结 Backbone
+# 目标不是刷 mAP，而是"精度不掉出验收线的前提下，把每帧成本压下来"
+# =====================================================================
+exp_id: a_nwd_p2
+seed: 0
+
+model:
+  nc: 1
+  p2: true               # 关键：stride 4 上 6px 目标放大后占 3 格
+
+pretrained: weights/yolov8n_coco.pt
+freeze_backbone: true
+freeze_upto: 9
+
+data:
+  mode: tile
+  tile: 256              # 见 experiments/results/tiling_curve.csv 的拐点
+  imgsz: 512             # 2 倍上采样
+  train_seqs: ["002", "005", "006", "008"]
+  val_seqs: ["003"]
+  neg_per_frame: 1       # 每帧额外 1 个纯背景图块
+  min_visible: 0.5
+
+loss:
+  box: nwd               # 小目标关键：IoU 对 2px 抖动过于敏感
+  nwd_c: 12.0            # 目标放大后约 10~18 px，C 取 12
+
+train:
+  epochs: 12
+  batch_size: 16
+  lr: 0.002
+  warmup_iters: 100
+  workers: 6
+  weight_decay: 0.0005
+  grad_clip: 10.0
+  amp: true
+  eval_every: 2
+  log_every: 50
+
+val:
+  proposal: oracle       # A 组只评检测器本身，提案漏检留给 M4
+  batch_size: 8
+  nms_iou: 0.5
+  conf_floor: 0.05

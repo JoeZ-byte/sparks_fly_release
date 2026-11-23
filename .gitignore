@@ -1,2 +1,12 @@
 __pycache__/
 *.pyc
+build/
+*.pyo
+.DS_Store
+# 预编译库要保留（属于交付物）
+!native/prebuilt/*.dll
+!native/prebuilt/*.so
+# 运行产物
+*.csv
+*.mp4.tmp
+out_*/

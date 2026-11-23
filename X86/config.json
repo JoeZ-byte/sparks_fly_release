@@ -1,0 +1,10 @@
+{
+  "model": "models/a_p2_nwd_v3_raw_int8.onnx",
+  "imgsz": 512,
+  "max_cells": 6,
+  "threads": 4,
+  "flow_w": 1.0,
+  "min_hits": 5,
+  "gate": 0.7,
+  "max_coast": 8
+}
