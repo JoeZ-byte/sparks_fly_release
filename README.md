@@ -57,6 +57,9 @@ python stream.py --input samples/sample_08_tiny_033.mp4 --backend python --frame
 | `--csv` `--save-video` `--show` | 输出轨迹 CSV / 叠加视频 / 实时窗口 |
 | `--seal-input/--seal-csv/--seal-video` + `--seal-key` | 密封（AES-256-GCM）通道，**仅飞腾派启用** |
 
+
+> 异步默认：两平台 `config.json` 都设了 `"async": true`，主程序同一份；关闭用 `--mode csv` 或改配置。
+
 ## 模型一览
 
 所有模型均在同一份训练集上训练（37 段序列，验证固定 010），指标为 010 序列的 mAP30。
