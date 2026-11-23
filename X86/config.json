@@ -4,6 +4,7 @@
   "max_cells": 6,
   "threads": 4,
   "threads_phytium": 2,
+  "async": true,
   "flow_w": 1.0,
   "min_hits": 5,
   "gate": 0.7,
