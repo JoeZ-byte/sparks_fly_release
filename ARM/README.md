@@ -33,6 +33,19 @@ python3 stream.py --input samples/sample_01_highway_002.mp4 --csv out.csv
 python3 stream.py --input samples/sample_08_tiny_033.mp4 --max-cells 4 --threads 4
 ```
 
+## 2.2 输出模式与异步
+
+```bash
+python stream.py --input in.mp4 --mode csv                    # 只记 CSV（不开窗口/不写视频）
+python stream.py --input in.mp4 --mode video --save-video r.mp4
+python stream.py --input in.mp4 --mode show                   # 实时演示
+python stream.py --input in.mp4 --mode show --async           # 异步：显示流畅、检测按能力跑
+```
+
+- `--mode` 取值 `csv|video|show|all`，`auto`（默认）按 `--show/--save-video` 推断。
+- `--async` 的后台线程与 `--out-fps` 限速；**默认值由 `config.json` 的 `"async": true` 控制**，两平台一致。
+- 无窗口无视频时异步自动改为逐帧阻塞，保证每帧都被处理。
+
 ## 实测
 
 | 平台 | 单图块推理（320 INT8） | 同步端到端 | 异步（显示 / 检测） |
