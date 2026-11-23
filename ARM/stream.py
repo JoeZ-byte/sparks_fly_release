@@ -59,7 +59,7 @@ def build_parser(cfg: dict, phytium: bool) -> argparse.ArgumentParser:
     ap.add_argument("--mode", default="auto", choices=["auto", "csv", "video", "show", "all"],
                     help="输出模式：csv=只记 CSV（无窗口/无视频）；video=渲染视频；"
                          "show=实时窗口；all=三者全开；auto=按参数推断")
-    ap.add_argument("--async", dest="async_mode", action="store_true",
+    ap.add_argument("--async", dest="async_mode", action="store_true", default=bool(cfg.get("async", False)),
                     help="异步检测：后台线程推理，显示/视频按速度外推（板端低帧率时保持流畅）")
     ap.add_argument("--imgsz", type=int, default=cfg.get("imgsz", 512), help="网络输入边长")
     ap.add_argument("--max-cells", type=int, default=cfg.get("max_cells", 6),
