@@ -1,0 +1,24 @@
+feat(arm): 飞腾派大小核适配（自动绑大核 + 2 线程）与密封通道平台门禁
+
+绑核
+- 实测飞腾派 E2000Q 为异构 2+2：cpu2/3 为 1.8 GHz 大核（cpu_capacity 1024），cpu0/1 为 1.5 GHz 小核（429）
+- 新增 --pin-cores auto|none|N,M；飞腾派自动绑大核，其它平台默认不绑
+- config.json 新增 threads_phytium=2（大核只有 2 个，4 线程无收益）
+- 002 段实测：4 线程不绑核 1088.5 ms → 2 线程绑大核 944.1 ms（+15%）；绑小核 2206 ms（-51%）
+
+密封通道（AES-256-GCM，仅飞腾派触发）
+- 新增 src/seal.py：分块流式加解密（SFLYSEAL 格式，与既有实现互通）、平台判定、大核探测、明文覆写擦除
+- stream.py 接入 --seal-input/--seal-csv/--seal-video/--seal-key
+- 非飞腾派平台直接拒绝（退出码 2），--force-seal 可在他处测试
+- 明文只落 /dev/shm 并用后覆写；视频编码器不可用时退回 MJPEG/AVI 或跳过
+- requirements 增加 cryptography（仅密封需要）
+
+验证
+- 飞腾派：识别 board=Phytium Pi Board、大核 [2,3]；加密输出 23945 B → 解密回读 23905 B 一致；
+  密封输入可直接作为视频源运行；默认配置 944.1 ms/帧（1.06 FPS）
+- x86：请求密封被拒绝（退出码 2），--force-seal 下正常产出 .enc
+- 树莓派：本轮网线已换到飞腾派，回归测试待后续补
+
+文档
+- README / ARM README：新增绑核与密封章节、飞腾派帧率改为实测值、CPU 拓扑更正为 2 大 + 2 小
+- ARM docs/02 增补拓扑与绑核实测表；ARM docs/03 增补绑核与密封用法；X86 docs/03 说明密封门禁

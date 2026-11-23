@@ -3,6 +3,7 @@
   "imgsz": 320,
   "max_cells": 6,
   "threads": 4,
+  "threads_phytium": 2,
   "flow_w": 1.0,
   "min_hits": 5,
   "gate": 0.7,

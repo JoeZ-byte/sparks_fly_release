@@ -37,11 +37,36 @@ python3 stream.py --input samples/sample_08_tiny_033.mp4 --max-cells 4 --threads
 
 | 平台 | 单图块推理（320 INT8） | 同步端到端 | 异步（显示 / 检测） |
 |---|---|---|---|
-| 树莓派 4B | 98.6 ms | 671.6 ms/帧（1.49 FPS） | 9.4 fps / 1.17 Hz |
-| 飞腾派 E2000Q | 130 ms | 1050 ms/帧（0.95 FPS） | 10.1 fps / 1.62 Hz |
+| 树莓派 4B（4×A72 同构） | 98.6 ms | 671.6 ms/帧（1.49 FPS） | 9.4 fps / 1.17 Hz |
+| 飞腾派 E2000Q（2 大 + 2 小） | 130 ms | **944.1 ms/帧（1.06 FPS）** | 10.1 fps / 1.62 Hz |
 
 板端瓶颈在推理：6 图块/帧时推理占端到端 89%。若需要流畅显示，可降 `--max-cells` 到 4，
 或使用异步检测（见 `docs/03_部署说明.md`）。
+
+## 板端专属：绑核与密封通道
+
+**绑核**（飞腾派默认自动生效）：cpu2/3 是 1.8 GHz 大核、cpu0/1 是 1.5 GHz 小核，
+程序默认 2 线程并绑定大核（`--pin-cores auto`）。实测：
+
+| 配置 | ms/帧 | FPS |
+|---|---|---|
+| 4 线程不绑核 | 1088.5 | 0.92 |
+| 4 线程绑小核 | 2206.0 | 0.45 |
+| 2 线程绑大核（默认） | **944.1** | **1.06** |
+
+其它平台同构四核，默认不绑（`--pin-cores none`）。
+
+**密封通道**（AES-256-GCM，仅飞腾派触发）：
+
+```bash
+KEY=$(python3 -c "import os;print(os.urandom(32).hex())")
+python3 stream.py --input in.mp4 --seal-csv tracks --seal-key $KEY    # 输出 tracks.csv.enc
+python3 stream.py --seal-input tracks.csv.enc --seal-key $KEY --frames 30
+```
+
+- 明文只落在 `/dev/shm`（内存），用完覆写删除；
+- 非飞腾派平台会直接拒绝，确需测试时加 `--force-seal`；
+- 需要 `pip install cryptography`。
 
 ## 训练
 

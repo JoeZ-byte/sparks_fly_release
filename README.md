@@ -50,7 +50,9 @@ python stream.py --input samples/sample_08_tiny_033.mp4 --backend python --frame
 | `--flow-w 1.0` / `--no-flow` | 光流速度先验权重（**默认开启**） |
 | `--no-tophat` | 关闭提案前的白顶帽增强（默认开启） |
 | `--min-hits 5` `--gate 0.7` | 轨迹确认门槛与关联门限 |
+| `--pin-cores auto\|none\|2,3` | 绑核。飞腾派默认自动绑大核（cpu2,3） |
 | `--csv` `--save-video` `--show` | 输出轨迹 CSV / 叠加视频 / 实时窗口 |
+| `--seal-input/--seal-csv/--seal-video` + `--seal-key` | 密封（AES-256-GCM）通道，**仅飞腾派启用** |
 
 ## 模型一览
 
@@ -73,6 +75,9 @@ python stream.py --input samples/sample_08_tiny_033.mp4 --backend python --frame
 | arm320 | `models/a_p2_nwd_arm320_raw_{fp32,int8}.onnx` | 0.8003 | 320 输入基线 |
 | rep320 | `models/a_p2_nwd_rep320_raw_{fp32,int8}.onnx` | 0.8083 | MobileOne 重参数化训练，推理结构与基线一致 |
 
+> 飞腾派不是 4 个同构核：cpu2/3 为 1.8 GHz 大核（cpu_capacity 1024），cpu0/1 为 1.5 GHz 小核（429）。
+> 程序会在飞腾派上自动 2 线程 + 绑大核（实测 1088 → 944 ms/帧，+15%；绑小核会慢到 2206 ms/帧）。
+>
 > 选型依据：x86 有余量，用 512 输入换精度；板端推理是瓶颈，用 320 输入换帧率。
 > 同一份 320 模型在树莓派 4B 上单图块 98.6 ms、飞腾派 E2000Q 上 130 ms。
 
@@ -82,7 +87,7 @@ python stream.py --input samples/sample_08_tiny_033.mp4 --backend python --frame
 |---|---|---|---|---|
 | x86（Ryzen 9 8945HX，4 线程） | 512 | 26.5 ms | 5.3 FPS | 6 图块/帧 |
 | 树莓派 4B（4×A72 1.8 GHz） | 320 | 98.6 ms | 1.49 FPS | 默认配置（光流+白顶帽开启） |
-| 飞腾派 E2000Q（4×1.5 GHz） | 320 | 130 ms | 0.95 FPS | 无 int8 点积指令，估算值 |
+| 飞腾派 E2000Q（2 大核 1.8 GHz + 2 小核 1.5 GHz） | 320 | 130 ms | **1.06 FPS** | 2 线程绑大核（默认） |
 
 同步模式下瓶颈全部在推理；若显示端需要流畅，可用异步检测 + 卡尔曼外推（显示 10 fps、检测 1.2~1.6 Hz），
 参数见各平台 docs。
