@@ -51,6 +51,9 @@ python stream.py --input samples/sample_08_tiny_033.mp4 --backend python --frame
 | `--no-tophat` | 关闭提案前的白顶帽增强（默认开启） |
 | `--min-hits 5` `--gate 0.7` | 轨迹确认门槛与关联门限 |
 | `--pin-cores auto\|none\|2,3` | 绑核。飞腾派默认自动绑大核（cpu2,3） |
+| `--mode csv\|video\|show\|all` | 输出模式：只记 CSV / 渲染视频 / 实时窗口 / 全开 |
+| `--async` | 异步检测：后台线程推理，显示与视频按速度外推 |
+| `--out-fps 10` | 输出限速（异步演示时用，0=不限） |
 | `--csv` `--save-video` `--show` | 输出轨迹 CSV / 叠加视频 / 实时窗口 |
 | `--seal-input/--seal-csv/--seal-video` + `--seal-key` | 密封（AES-256-GCM）通道，**仅飞腾派启用** |
 
