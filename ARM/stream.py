@@ -4,14 +4,21 @@
   --backend native   调用 C/C++ 加速库（默认，推荐）
   --backend python   纯 Python 流水线（无编译依赖，便于对照）
 
+三种输出模式（--mode）：
+  csv    只记 CSV，不开窗口、不写视频（板端后台跑、批量评测）
+  video  渲染叠加视频（可选同时记 CSV）
+  show   实时窗口演示（可选同时记 CSV / 录视频）
+  all    三者全开；auto=按 --show / --save-video 推断
+
 平台相关：
-  * 飞腾派（2 大核 + 2 小核）：默认 2 线程并绑定大核；支持密封（AES-256-GCM）通道。
-  * 其它平台：默认 4 线程、不绑核；密封通道需显式 --force-seal。
+  * 飞腾派（2 大核 + 2 小核）：默认 2 线程并绑定大核；密封（AES-256-GCM）通道可用。
+  * 其它平台（含树莓派）：默认 4 线程、不绑核；密封通道默认拒绝（--force-seal 可测）。
 
 示例：
-  python stream.py --input samples/sample_08_tiny_033.mp4 --csv out.csv
-  python stream.py --input samples/sample_01_highway_002.mp4 --backend python --frames 60
-  python stream.py --seal-input video.enc --seal-key <64hex> --seal-csv out.csv
+  python stream.py --input in.mp4 --mode csv                     # 只出 CSV
+  python stream.py --input in.mp4 --mode video --save-video r.mp4
+  python stream.py --input in.mp4 --mode show                    # 实时演示
+  python stream.py --input in.mp4 --mode show --async            # 板端异步演示
 """
 from __future__ import annotations
 
@@ -19,6 +26,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -48,6 +56,11 @@ def build_parser(cfg: dict, phytium: bool) -> argparse.ArgumentParser:
     ap.add_argument("--model", default=cfg.get("model", ""), help="ONNX 模型路径")
     ap.add_argument("--backend", default="native", choices=["native", "python"],
                     help="native=链接 C/C++ 加速库；python=纯 Python 流水线")
+    ap.add_argument("--mode", default="auto", choices=["auto", "csv", "video", "show", "all"],
+                    help="输出模式：csv=只记 CSV（无窗口/无视频）；video=渲染视频；"
+                         "show=实时窗口；all=三者全开；auto=按参数推断")
+    ap.add_argument("--async", dest="async_mode", action="store_true",
+                    help="异步检测：后台线程推理，显示/视频按速度外推（板端低帧率时保持流畅）")
     ap.add_argument("--imgsz", type=int, default=cfg.get("imgsz", 512), help="网络输入边长")
     ap.add_argument("--max-cells", type=int, default=cfg.get("max_cells", 6),
                     help="每帧最多推理的图块数")
@@ -67,19 +80,20 @@ def build_parser(cfg: dict, phytium: bool) -> argparse.ArgumentParser:
     ap.add_argument("--min-hits", type=int, default=cfg.get("min_hits", 5), help="轨迹确认命中帧数")
     ap.add_argument("--gate", type=float, default=cfg.get("gate", 0.7), help="关联门限倍率")
     ap.add_argument("--max-coast", type=int, default=cfg.get("max_coast", 8), help="最大外推帧数")
-    ap.add_argument("--csv", default="", help="轨迹 CSV 输出路径（明文）")
+    ap.add_argument("--csv", default="", help="轨迹 CSV 路径（明文）")
     ap.add_argument("--save-video", default="", help="叠加结果视频（明文 mp4）")
-    ap.add_argument("--show", action="store_true", help="实时显示窗口")
+    ap.add_argument("--show", action="store_true", help="实时显示窗口（等价 --mode show）")
+    ap.add_argument("--out-fps", type=float, default=0.0,
+                    help="输出/显示限速（0=不限；板端异步演示可用 10）")
     ap.add_argument("--native-lib", default="", help="显式指定加速库路径")
     ap.add_argument("--print-every", type=int, default=30, help="每 N 帧打印一次进度")
     return ap
 
 
-def apply_cores(spec: str, phytium: bool) -> list[int]:
-    """按参数绑定 CPU；返回实际绑定的核列表（空表示未绑）。"""
+def apply_cores(spec: str, phytium: bool) -> list:
     if spec == "none":
         return []
-    cores: list[int] = []
+    cores = []
     if spec == "auto":
         if phytium:
             cores = big_cores()
@@ -97,7 +111,68 @@ def apply_cores(spec: str, phytium: bool) -> list[int]:
         return []
 
 
-def draw(frame: np.ndarray, tracks: list[dict]) -> np.ndarray:
+class AsyncRunner:
+    """后台线程跑整条流水线；主线程按显示帧率渲染，用上一帧结果线性外推。
+
+    最新帧优先：上一帧还没跑完就丢弃当前帧（跳帧），保证显示不积压。
+    """
+
+    def __init__(self, pipe) -> None:
+        self.pipe = pipe
+        self._cv = threading.Condition()
+        self._job = None
+        self._out = None
+        self._stop = False
+        self.busy = False
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def submit(self, frame) -> bool:
+        with self._cv:
+            if self._job is not None:
+                return False
+            self._job = frame.copy()
+            self.busy = True
+            self._cv.notify()
+            return True
+
+    def poll(self):
+        with self._cv:
+            if self._out is None:
+                return None
+            out, self._out = self._out, None
+            return out
+
+    def _loop(self) -> None:
+        while True:
+            with self._cv:
+                while self._job is None and not self._stop:
+                    self._cv.wait(0.05)
+                if self._stop:
+                    return
+                job, self._job = self._job, None
+            res = self.pipe.step(job)
+            with self._cv:
+                self._out = res
+                self.busy = False
+
+    def wait(self, timeout: float = 2.0):
+        """阻塞直到有结果（头less 模式用，保证每帧都被真正处理）。"""
+        end = time.time() + timeout
+        while time.time() < end:
+            out = self.poll()
+            if out is not None:
+                return out
+            time.sleep(0.002)
+        return self.poll()
+
+    def close(self) -> None:
+        with self._cv:
+            self._stop = True
+            self._cv.notify()
+
+
+def draw(frame: np.ndarray, tracks: list) -> np.ndarray:
     out = frame.copy()
     for t in tracks:
         x1, y1, x2, y2 = [int(v) for v in t["box"]]
@@ -139,7 +214,7 @@ def main() -> int:
     # ---- 输入：明文或密封 ----
     tmp_in = None
     if args.seal_input:
-        tmp_in = tmp_plain_path("in")
+        tmp_in = tmp_plain_path("in", ".mp4")
         n = unseal_file(Path(args.seal_input), tmp_in, key)
         print("已解密输入 %.1f MB -> %s" % (n / 2 ** 20, tmp_in))
         video_path = tmp_in
@@ -169,15 +244,39 @@ def main() -> int:
         print("打不开视频: %s" % video_path, file=sys.stderr)
         return 2
 
-    # ---- 输出：明文或密封（先写临时明文，结束后加密并擦除）----
+    # ---- 输出模式 ----
+    mode = args.mode
+    if mode == "auto":
+        if args.show:
+            mode = "all" if (args.save_video or args.seal_video) else "show"
+        elif args.save_video or args.seal_video:
+            mode = "video"
+        else:
+            mode = "csv"
+    want_show = mode in ("show", "all") or args.show
+    want_video = mode in ("video", "all") or bool(args.save_video) or bool(args.seal_video)
+    want_csv = mode in ("csv", "video", "all") or bool(args.csv) or bool(args.seal_csv)
+    if not (want_csv or want_video or want_show):
+        want_csv = True
+    print("输出模式：%s（CSV=%s 视频=%s 窗口=%s 异步=%s）" % (
+        mode, want_csv, want_video, want_show, args.async_mode))
+
     csv_plain = Path(args.csv) if args.csv else None
     vid_plain = Path(args.save_video) if args.save_video else None
     tmp_csv = tmp_plain_path("csv", ".csv") if args.seal_csv else None
     tmp_vid = tmp_plain_path("vid", ".mp4") if args.seal_video else None
     if tmp_csv is not None:
         csv_plain = tmp_csv
+    elif want_csv:
+        csv_plain = csv_plain or Path("tracks.csv")
+    else:
+        csv_plain = None
     if tmp_vid is not None:
         vid_plain = tmp_vid
+    elif want_video:
+        vid_plain = vid_plain or Path("out.mp4")
+    else:
+        vid_plain = None
 
     writer = None
     if vid_plain is not None:
@@ -185,7 +284,7 @@ def main() -> int:
         w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         writer = cv2.VideoWriter(str(vid_plain), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
-        if not writer.isOpened():   # 无 mp4v 编码器时退回 MJPEG/AVI
+        if not writer.isOpened():          # 无 mp4v 编码器时退回 MJPEG/AVI
             alt = vid_plain.with_suffix(".avi")
             writer = cv2.VideoWriter(str(alt), cv2.VideoWriter_fourcc(*"MJPG"), fps, (w, h))
             if writer.isOpened():
@@ -198,9 +297,23 @@ def main() -> int:
     if csv_fh:
         csv_fh.write("track_id,frame,x1,y1,x2,y2,px_per_frame,kmh\n")
 
+    if args.async_mode and args.out_fps <= 0:
+        if want_video:
+            args.out_fps = cap.get(cv2.CAP_PROP_FPS) or 10.0
+        elif want_show:
+            args.out_fps = 10.0
+        print("异步模式：输出限速 %.1f fps（0 表示无显示/视频时按帧阻塞等结果）" % args.out_fps)
+
+    runner = AsyncRunner(pipe) if args.async_mode else None
+    last_tracks = []
+    last_by_id = {}
+    vx = {}
+    vy = {}
+
     t0 = time.time()
     n = 0
     total_trk = 0
+    out_period = (1.0 / args.out_fps) if args.out_fps > 0 else 0.0
     while True:
         ok, frame = cap.read()
         if not ok:
@@ -209,21 +322,50 @@ def main() -> int:
         if args.frames and n > args.frames:
             n -= 1
             break
-        tracks = pipe.step(frame)
+
+        if runner is not None:
+            runner.submit(frame)
+            res = runner.poll() if out_period > 0 else runner.wait(5.0)
+            if res is not None:
+                tracks = res
+                for t in tracks:                       # 记录逐 ID 位移，供外推
+                    prev = last_by_id.get(t["track_id"])
+                    if prev is not None:
+                        vx[t["track_id"]] = t["box"][0] - prev[0]
+                        vy[t["track_id"]] = t["box"][1] - prev[1]
+                    last_by_id[t["track_id"]] = t["box"]
+                last_tracks = tracks
+            elif last_tracks:                          # 检测未就绪：按速度外推
+                tracks = []
+                for t in last_tracks:
+                    tid = t["track_id"]
+                    dx, dy = vx.get(tid, 0.0), vy.get(tid, 0.0)
+                    b = t["box"]
+                    tracks.append(dict(t, box=(b[0] + dx, b[1] + dy, b[2] + dx, b[3] + dy)))
+                last_tracks = tracks
+            else:
+                tracks = []
+        else:
+            tracks = pipe.step(frame)
         total_trk += len(tracks)
+
         if csv_fh:
             for t in tracks:
                 csv_fh.write("%d,%d,%.2f,%.2f,%.2f,%.2f,%.4f,%.1f\n" % (
                     t["track_id"], n, t["box"][0], t["box"][1], t["box"][2], t["box"][3],
                     t["px"], t["kmh"]))
-        if writer is not None or args.show:
+        if writer is not None or want_show:
             vis = draw(frame, tracks)
             if writer is not None:
                 writer.write(vis)
-            if args.show:
+            if want_show:
                 cv2.imshow("satstream", vis)
                 if cv2.waitKey(1) & 0xFF == 27:
                     break
+        if out_period > 0:
+            dt = time.time() - t0
+            if dt < n * out_period:
+                time.sleep(n * out_period - dt)
         if args.print_every and n % args.print_every == 0:
             print("  帧 %d … %.1f FPS，轨迹 %d" % (n, n / max(time.time() - t0, 1e-6), total_trk))
 
@@ -242,8 +384,10 @@ def main() -> int:
         writer.release()
     if csv_fh:
         csv_fh.close()
-    if args.show:
+    if want_show:
         cv2.destroyAllWindows()
+    if runner is not None:
+        runner.close()
     if hasattr(pipe, "close"):
         pipe.close()
 
