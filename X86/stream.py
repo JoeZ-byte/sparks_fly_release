@@ -176,7 +176,11 @@ class AsyncRunner:
     def close(self) -> None:
         with self._cv:
             self._stop = True
-            self._cv.notify()
+            self._cv.notify_all()
+        try:                              # 必须等线程退出，否则 pipe 释放后线程仍在推理（段错误）
+            self.thread.join(timeout=15.0)
+        except RuntimeError:
+            pass
 
 
 def cv2_has_gui() -> bool:
@@ -367,6 +371,11 @@ def main() -> int:
     if csv_fh:
         csv_fh.write("track_id,frame,x1,y1,x2,y2,px_per_frame,kmh\n")
 
+    if args.async_mode and not want_show:
+        # 无窗口（csv/video）时外推没有意义：输出速度不受显示帧率限制，
+        # 异步只会让主循环跑空、统计为 0。强制同步，保证每帧都真正处理。
+        print("提示：无窗口模式自动关闭异步（仅窗口演示使用异步外推）")
+        args.async_mode = False
     if args.async_mode and args.out_fps <= 0:
         if want_video:
             args.out_fps = cap.get(cv2.CAP_PROP_FPS) or 10.0
