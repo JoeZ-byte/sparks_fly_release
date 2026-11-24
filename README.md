@@ -54,6 +54,9 @@ python stream.py --input samples/sample_08_tiny_033.mp4 --backend python --frame
 | `--mode csv\|video\|show\|all` | 输出模式：只记 CSV / 渲染视频 / 实时窗口 / 全开 |
 | `--async` | 异步检测：后台线程推理，显示与视频按速度外推 |
 | `--out-fps 10` | 输出限速（异步演示时用，0=不限） |
+| `--prewarm 12` | 预热：先静默跑 N 帧建立背景/轨迹，再回卷到第 1 帧（演示用，两后端通用） |
+| `--show-backend auto\|cv2\|tk` | 窗口后端；OpenCV 为 headless 版时自动退回 tkinter（需 python3-tk + Pillow） |
+| `--display-scale 0.55` `--fullscreen` | 窗口缩放 / 全屏（1024×600 屏用 0.55） |
 | `--csv` `--save-video` `--show` | 输出轨迹 CSV / 叠加视频 / 实时窗口 |
 | `--seal-input/--seal-csv/--seal-video` + `--seal-key` | 密封（AES-256-GCM）通道，**仅飞腾派启用** |
 
