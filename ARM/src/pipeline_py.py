@@ -446,7 +446,9 @@ class MotionProposer:
             return np.zeros_like(small, np.uint8)
         diff = cv2.absdiff(small, self.bg.astype(np.uint8))
         mask = (diff > self.thr).astype(np.uint8) * 255
-        return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self.kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self.kernel)
+        self.last_mask = mask
+        return mask
 
     def _cells(self, mask: np.ndarray) -> np.ndarray:
         ny = max(1, int(math.ceil(self.h / TILE)))
@@ -466,6 +468,7 @@ class MotionProposer:
         3. 只取全局前 ``max_cells`` 个格子——**总图块数恒等于预算**。
         """
         mask = self._mask(gray, half_img)
+        self.last_mask = mask
         scores = self._cells(mask).astype(np.float32)
         mx = float(scores.max()) if scores.size else 0.0
         if mx > 0:
