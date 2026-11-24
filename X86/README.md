@@ -52,6 +52,9 @@ python stream.py --input in.mp4 --mode show --async           # 异步：显示�
 - `--async` 的后台线程与 `--out-fps` 限速；**默认值由 `config.json` 的 `"async": true` 控制**，两平台一致。
 - 无窗口无视频时异步自动改为逐帧阻塞，保证每帧都被处理。
 
+
+> 演示提示：`--prewarm 12 --show-backend tk --fullscreen --display-scale 0.55 --async` 可做到开局即有轨迹；详见 `docs/03`。
+
 ## 实测（Ryzen 9 8945HX，4 线程，6 图块/帧）
 
 | 配置 | 单图块推理 | 端到端 |
