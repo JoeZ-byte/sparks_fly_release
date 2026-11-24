@@ -168,7 +168,11 @@ def dump_demo(args):
     card_f = int(args.dump_card * 10)
     total = 0
     for stage in range(len(STAGES)):
-        img = card(STAGES[stage][0], STAGES[stage][1].replace(" -> ", " -> ").replace("，", "，"))
+        # 每个阶段重置流水线与播放位置：否则素材循环会累积旧轨迹、ID 一路涨到上万
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        pipe = PyPipeline(Path(args.model), imgsz=args.imgsz, max_cells=6, threads=4, conf=0.2,
+                          flow_w=1.0, pre_mode=1, min_hits=5, gate=0.7, max_coast=8)
+        img = card(STAGES[stage][0], STAGES[stage][1])
         for _ in range(card_f):
             vw.write(img)
             total += 1
