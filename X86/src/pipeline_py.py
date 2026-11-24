@@ -183,7 +183,7 @@ def greedy_assign(sub: np.ndarray) -> list[tuple[int, int]]:
     return out
 
 
-def gated_assign(cost: np.ndarray, top_k: int = 0, exact_max: int = 12) -> list[tuple[int, int]]:
+def gated_assign(cost: np.ndarray, top_k: int = 3, exact_max: int = 12) -> list[tuple[int, int]]:
     """带门限的匹配：候选截断 -> 连通分量拆分 -> 小组精确 / 大组贪心。
 
     三级策略，保证密集场景也是毫秒级：
@@ -1380,9 +1380,7 @@ def main() -> int:
                 tracks = tracker.coast()
                 spd = speed.update(tracks, fno)
             if async_det.busy is False:
-                tb = np.asarray([x.box for x in tracker.tracks], np.float32).reshape(-1, 4)
-                origins = (warm_grid if fno <= warm_frames else
-                           prop.propose(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), tb))
+                # 复用本帧已算好的 origins/crops（不再二次 propose：避免背景模型重复推进）
                 crops, rects, seen = [], [], set()
                 for x0, y0 in origins:
                     x0 = max(0, min(W - TILE, int(x0)))
@@ -1592,18 +1590,22 @@ class PyPipeline:
 
     # ---------------- 光流：块匹配（SAD），返回像素/帧 ----------------
     @staticmethod
-    def _flow(prev_gray, gray, box, r: int = 3, pw: int = 5):
+    def _flow(prev_gray, gray, box, r: int = 6, pw: int = 5):
         cx = int((box[0] + box[2]) * 0.5)
         cy = int((box[1] + box[3]) * 0.5)
         H, W = gray.shape[:2]
         if cx - r - pw < 0 or cy - r - pw < 0 or cx + r + pw >= W or cy + r + pw >= H:
             return 0.0, 0.0
         patch = prev_gray[cy - pw:cy + pw + 1, cx - pw:cx + pw + 1].astype(np.int16)
-        win = np.lib.stride_tricks.sliding_window_view(
-            gray[cy - r - pw:cy + r + pw + 1, cx - r - pw:cx + r + pw + 1], (2 * pw + 1, 2 * pw + 1))
-        sad = np.abs(win.astype(np.int16) - patch).sum(axis=(2, 3))
-        iy, ix = np.unravel_index(int(sad.argmin()), sad.shape)
-        return float(ix - r), float(iy - r)
+        best = (1 << 30, 0, 0)
+        for dy in range(-r, r + 1):
+            for dx in range(-r, r + 1):
+                cand = gray[cy + dy - pw:cy + dy + pw + 1,
+                            cx + dx - pw:cx + dx + pw + 1].astype(np.int16)
+                sad = int(np.abs(cand - patch).sum())
+                if sad < best[0]:
+                    best = (sad, dx, dy)
+        return float(best[1]), float(best[2])
 
     def _apply_flow(self, gray) -> None:
         for t in self.tracker.tracks:

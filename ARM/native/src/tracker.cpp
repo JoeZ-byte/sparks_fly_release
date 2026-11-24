@@ -423,7 +423,8 @@ std::vector<int> Tracker::update(const std::vector<Det>& dets, const float* desc
                 cost[i * n_det + j] = (norm > gate) ? std::numeric_limits<double>::quiet_NaN() : c;
             }
         }
-        for (auto& pr : gated_assign(cost, n_tr, n_det)) {
+        const int tk_topk = std::max(3, std::min(8, n_det / std::max(n_tr, 1) + 2));
+        for (auto& pr : gated_assign(cost, n_tr, n_det, tk_topk, 12)) {
             tracks[pr.first].update(dets[pr.second].b, dets[pr.second].s);
             det_matched[pr.second] = 1;
             // 外观 EMA：匹配上就用检测的直方图更新轨迹外观
