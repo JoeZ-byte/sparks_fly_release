@@ -83,6 +83,11 @@ def build_parser(cfg: dict, phytium: bool) -> argparse.ArgumentParser:
     ap.add_argument("--csv", default="", help="轨迹 CSV 路径（明文）")
     ap.add_argument("--save-video", default="", help="叠加结果视频（明文 mp4）")
     ap.add_argument("--show", action="store_true", help="实时显示窗口（等价 --mode show）")
+    ap.add_argument("--show-backend", default="auto", choices=["auto", "cv2", "tk"],
+                    help="窗口后端：auto=有 GUI 的 cv2 则用 cv2，否则用 tkinter")
+    ap.add_argument("--fullscreen", action="store_true", help="窗口全屏（演示用）")
+    ap.add_argument("--display-scale", type=float, default=1.0,
+                    help="显示缩放（窗口模式用，1024x600 屏建议 0.55）")
     ap.add_argument("--out-fps", type=float, default=0.0,
                     help="输出/显示限速（0=不限；板端异步演示可用 10）")
     ap.add_argument("--native-lib", default="", help="显式指定加速库路径")
@@ -170,6 +175,58 @@ class AsyncRunner:
         with self._cv:
             self._stop = True
             self._cv.notify()
+
+
+def cv2_has_gui() -> bool:
+    """探测 OpenCV 是否带 GUI（headless 版 imshow 会抛错）。"""
+    try:
+        cv2.namedWindow("__probe__", cv2.WINDOW_AUTOSIZE)
+        cv2.destroyWindow("__probe__")
+        return True
+    except Exception:
+        return False
+
+
+class TkWindow:
+    """tkinter 显示窗口（OpenCV headless 时的替代，依赖 python3-tk + Pillow）。"""
+
+    def __init__(self, title: str = "satstream", scale: float = 1.0,
+                 fullscreen: bool = False) -> None:
+        import tkinter as tk
+        from PIL import Image, ImageTk
+        self._Image = Image
+        self._ImageTk = ImageTk
+        self.root = tk.Tk()
+        self.root.title(title)
+        self.scale = float(scale) if scale else 1.0
+        self.label = tk.Label(self.root, bg="black", bd=0)
+        self.label.pack(expand=True)
+        if fullscreen:
+            self.root.attributes("-fullscreen", True)
+            self.root.configure(bg="black")
+        self.photo = None
+        self.quit_flag = False
+        self.root.bind("<Escape>", lambda _e: self._close())
+        self.root.protocol("WM_DELETE_WINDOW", self._close)
+
+    def _close(self) -> None:
+        self.quit_flag = True
+
+    def show(self, bgr) -> bool:
+        img = self._Image.fromarray(bgr[:, :, ::-1])
+        if self.scale != 1.0:
+            img = img.resize((max(1, int(img.width * self.scale)),
+                              max(1, int(img.height * self.scale))))
+        self.photo = self._ImageTk.PhotoImage(img)
+        self.label.configure(image=self.photo)
+        self.root.update()
+        return not self.quit_flag
+
+    def close(self) -> None:
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
 
 
 def draw(frame: np.ndarray, tracks: list) -> np.ndarray:
@@ -304,6 +361,16 @@ def main() -> int:
             args.out_fps = 10.0
         print("异步模式：输出限速 %.1f fps（0 表示无显示/视频时按帧阻塞等结果）" % args.out_fps)
 
+    win = None
+    if want_show:
+        backend = args.show_backend
+        if backend == "auto":
+            backend = "cv2" if cv2_has_gui() else "tk"
+        if backend == "tk":
+            win = TkWindow("satstream", args.display_scale, args.fullscreen)
+            args.display_scale = 1.0          # 缩放已在 TkWindow 内完成
+        print("窗口后端：%s" % backend)
+
     runner = AsyncRunner(pipe) if args.async_mode else None
     last_tracks = []
     last_by_id = {}
@@ -359,9 +426,17 @@ def main() -> int:
             if writer is not None:
                 writer.write(vis)
             if want_show:
-                cv2.imshow("satstream", vis)
-                if cv2.waitKey(1) & 0xFF == 27:
-                    break
+                if win is not None:
+                    if not win.show(vis):
+                        break
+                else:
+                    shown = vis
+                    if args.display_scale and args.display_scale != 1.0:
+                        shown = cv2.resize(vis, None, fx=args.display_scale,
+                                           fy=args.display_scale, interpolation=cv2.INTER_AREA)
+                    cv2.imshow("satstream", shown)
+                    if cv2.waitKey(1) & 0xFF == 27:
+                        break
         if out_period > 0:
             dt = time.time() - t0
             if dt < n * out_period:
@@ -384,7 +459,9 @@ def main() -> int:
         writer.release()
     if csv_fh:
         csv_fh.close()
-    if want_show:
+    if win is not None:
+        win.close()
+    elif want_show:
         cv2.destroyAllWindows()
     if runner is not None:
         runner.close()

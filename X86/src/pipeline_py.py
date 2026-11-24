@@ -434,9 +434,13 @@ class MotionProposer:
         self.last_seen = np.zeros((ny, nx), np.float32)
         self.frame = 0
 
-    def _mask(self, gray: np.ndarray) -> np.ndarray:
+    def _mask(self, gray: np.ndarray, half_img=None) -> np.ndarray:
         """运动掩膜。半分辨率计算：格子只用来投票，不需要全分辨率精度。"""
-        small = cv2.resize(gray, (self.w // 2, self.h // 2), interpolation=cv2.INTER_AREA)
+        if half_img is not None:
+            small = half_img
+        else:
+            small = cv2.resize(gray, (self.w // 2, self.h // 2),
+                               interpolation=cv2.INTER_AREA)
         if self.bg is None:
             self.bg = small.astype(np.float32)
             return np.zeros_like(small, np.uint8)
@@ -452,7 +456,7 @@ class MotionProposer:
         return np.rint(small * (m.shape[0] / ny) * (m.shape[1] / nx)).astype(np.int64)
 
     def propose(self, gray: np.ndarray, track_boxes: np.ndarray,
-                track_bonus: float = 0.6) -> np.ndarray:
+                  track_bonus: float = 0.6, half_img=None) -> np.ndarray:
         """选本帧要推理的图块：运动最激烈的 K 个格子 + 有轨迹的格子，总数硬上限 K。
 
         之前的实现会"每有一条轨迹就加一个图块"，密集场景直接炸到 42 块/帧
@@ -461,7 +465,7 @@ class MotionProposer:
         2. 轨迹中心所在格子加一个先验分（保证慢车/静止车不漏）；
         3. 只取全局前 ``max_cells`` 个格子——**总图块数恒等于预算**。
         """
-        mask = self._mask(gray)
+        mask = self._mask(gray, half_img)
         scores = self._cells(mask).astype(np.float32)
         mx = float(scores.max()) if scores.size else 0.0
         if mx > 0:
@@ -482,13 +486,14 @@ class MotionProposer:
         picked = [(int(i) % nx * TILE, int(i) // nx * TILE) for i in order]
         for i in order:
             self.last_seen[int(i) // nx, int(i) % nx] = self.frame
-        self.update_bg(gray)          # 背景统一在半分辨率上推进
+        self.update_bg(gray, half_img)   # 背景与掩膜必须用同一域（同预处理的半分辨率）
         return np.asarray(picked, np.int32).reshape(-1, 2)
 
-    def update_bg(self, gray: np.ndarray) -> None:
+    def update_bg(self, gray: np.ndarray, half_img=None) -> None:
         """只推进背景模型（非检测帧用，保持掩膜时序一致）。"""
-        g = cv2.resize(gray, (self.w // 2, self.h // 2),
-                       interpolation=cv2.INTER_AREA).astype(np.float32)
+        g = (half_img.astype(np.float32) if half_img is not None else
+             cv2.resize(gray, (self.w // 2, self.h // 2),
+                        interpolation=cv2.INTER_AREA).astype(np.float32))
         if self.bg is None or self.bg.shape != g.shape:
             self.bg = g.copy()
             return
@@ -1626,16 +1631,17 @@ class PyPipeline:
                                    display_coast=self.max_coast)
             self.speed = SpeedEstimator(SPEED_K, SPEED_FPS)
 
-        g = gray
+        # 与 C++ 内核一致：先降采样到半分辨率，再做白顶帽（而不是在全分辨率上做）
+        half = cv2.resize(gray, (W // 2, H // 2), interpolation=cv2.INTER_AREA)
         if self.pre_mode == 1:
-            g = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, np.ones((3, 3), np.uint8))
+            half = cv2.morphologyEx(half, cv2.MORPH_TOPHAT, np.ones((3, 3), np.uint8))
 
         tb = np.asarray([t.box for t in self.tracker.tracks], np.float32).reshape(-1, 4)
         if self.frame <= self.warmup:
-            self.prop.propose(g, np.zeros((0, 4), np.float32))
+            self.prop.propose(gray, np.zeros((0, 4), np.float32), half_img=half)
             self.prev_gray = gray
             return []
-        origins = self.prop.propose(g, tb)
+        origins = self.prop.propose(gray, tb, half_img=half)
 
         crops, rects, seen = [], [], set()
         for x0, y0 in origins:
