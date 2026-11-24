@@ -155,47 +155,65 @@ def read_ctl(path):
 
 
 def dump_demo(args):
-    pipe = PyPipeline(Path(args.model), imgsz=args.imgsz, max_cells=6, threads=4, conf=0.2,
-                      flow_w=1.0, pre_mode=1, min_hits=5, gate=0.7, max_coast=8)
-    cap = cv2.VideoCapture(args.input)
-    if not cap.isOpened():
-        print("打不开视频", file=sys.stderr)
-        return 2
-    out = Path(args.dump)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    vw = cv2.VideoWriter(str(out), cv2.VideoWriter_fourcc(*"mp4v"), 10.0, (1024, 1024))
-    per = int(args.dump_per_stage * 10)
-    card_f = int(args.dump_card * 10)
-    total = 0
-    for stage in range(len(STAGES)):
-        # 每个阶段重置流水线与播放位置：否则素材循环会累积旧轨迹、ID 一路涨到上万
-        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    """单遍多视角录制：素材只播一遍，同时输出 5 个阶段的画面，最后按阶段拼接。
+
+    这样避免了"每阶段循环播放"导致背景模型与跟踪器跨回卷错乱（会产生大量假轨迹）。
+    """
+    import tempfile
+
+    clips = [c for c in [args.input, args.input2] if c]
+    tmp = Path(tempfile.mkdtemp(prefix="satdemo_"))
+    per_stage = [[] for _ in STAGES]
+    for ci, clip in enumerate(clips):
+        cap = cv2.VideoCapture(clip)
+        if not cap.isOpened():
+            print("打不开", clip, file=sys.stderr)
+            continue
         pipe = PyPipeline(Path(args.model), imgsz=args.imgsz, max_cells=6, threads=4, conf=0.2,
                           flow_w=1.0, pre_mode=1, min_hits=5, gate=0.7, max_coast=8)
-        img = card(STAGES[stage][0], STAGES[stage][1])
-        for _ in range(card_f):
-            vw.write(img)
-            total += 1
-        done = 0
-        st = {}
-        while done < per:
+        ws = [cv2.VideoWriter(str(tmp / ("c%d_s%d.mp4" % (ci, s))),
+                              cv2.VideoWriter_fourcc(*"mp4v"), 10.0, (1024, 1024))
+              for s in range(len(STAGES))]
+        n = 0
+        while True:
             ok, f = cap.read()
             if not ok:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                continue
-            t0 = time.time()
+                break
             tracks = pipe.step(f)
             st = {"frame": pipe.frame, "mask": getattr(pipe.prop, "last_mask", None),
                   "origins": getattr(pipe.prop, "last_origins", []), "tracks": tracks,
-                  "tiles": getattr(pipe, "tiles", 0), "ms": (time.time() - t0) * 1000.0}
-            vw.write(compose(f, stage, st))
-            done += 1
+                  "tiles": getattr(pipe, "tiles", 0), "ms": 0.0}
+            for s in range(len(STAGES)):
+                ws[s].write(compose(f, s, st))
+            n += 1
+            if n % 100 == 0:
+                print("  %s 已处理 %d 帧" % (Path(clip).name, n), flush=True)
+        for w in ws:
+            w.release()
+        cap.release()
+        for s in range(len(STAGES)):
+            per_stage[s].append(tmp / ("c%d_s%d.mp4" % (ci, s)))
+        print("  %s 完成 %d 帧" % (Path(clip).name, n), flush=True)
+
+    vw = cv2.VideoWriter(args.dump, cv2.VideoWriter_fourcc(*"mp4v"), 10.0, (1024, 1024))
+    total = 0
+    for s in range(len(STAGES)):
+        img = card(STAGES[s][0], STAGES[s][1])
+        for _ in range(int(args.dump_card * 10)):
+            vw.write(img)
             total += 1
-            if done % 100 == 0:
-                print("  %s  %d/%d  总 %d" % (STAGES[stage][0], done, per, total), flush=True)
+        for path in per_stage[s]:
+            c2 = cv2.VideoCapture(str(path))
+            while True:
+                ok, f = c2.read()
+                if not ok:
+                    break
+                vw.write(f)
+                total += 1
+            c2.release()
     vw.release()
     print("完成 %s：%d 帧, %.1f 分钟, %.1f MB" % (
-        out, total, total / 600.0, out.stat().st_size / 2 ** 20))
+        args.dump, total, total / 600.0, Path(args.dump).stat().st_size / 2 ** 20))
     return 0
 
 
@@ -208,6 +226,7 @@ def main():
     ap.add_argument("--fullscreen", action="store_true")
     ap.add_argument("--ctl", default=str(HERE / "ctl"))
     ap.add_argument("--stage-seconds", type=float, default=6.0)
+    ap.add_argument("--input2", default="", help="第二段素材（可选，与 input 依次播放）")
     ap.add_argument("--dump", default="")
     ap.add_argument("--dump-per-stage", type=float, default=50.0)
     ap.add_argument("--dump-card", type=float, default=6.0)

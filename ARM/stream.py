@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 import os
 import sys
@@ -59,6 +60,8 @@ def build_parser(cfg: dict, phytium: bool) -> argparse.ArgumentParser:
     ap.add_argument("--mode", default="auto", choices=["auto", "csv", "video", "show", "all"],
                     help="输出模式：csv=只记 CSV（无窗口/无视频）；video=渲染视频；"
                          "show=实时窗口；all=三者全开；auto=按参数推断")
+    ap.add_argument("--async-wait", type=float, default=2.0,
+                    help="异步时单帧最多等待结果的时间（秒）")
     ap.add_argument("--async", dest="async_mode", action="store_true", default=bool(cfg.get("async", False)),
                     help="异步检测：后台线程推理，显示/视频按速度外推（板端低帧率时保持流畅）")
     ap.add_argument("--imgsz", type=int, default=cfg.get("imgsz", 512), help="网络输入边长")
@@ -81,6 +84,9 @@ def build_parser(cfg: dict, phytium: bool) -> argparse.ArgumentParser:
     ap.add_argument("--no-tophat", action="store_true", help="关闭提案前的白顶帽增强")
     ap.add_argument("--min-hits", type=int, default=cfg.get("min_hits", 5), help="轨迹确认命中帧数")
     ap.add_argument("--gate", type=float, default=cfg.get("gate", 0.7), help="关联门限倍率")
+    ap.add_argument("--straight-min", type=float, default=0.55,
+                    help="方向一致性下限（0~1）：低于该值的轨迹视为来回乱窜，不输出/不绘制")
+    ap.add_argument("--no-straight-filter", action="store_true", help="关闭方向一致性过滤")
     ap.add_argument("--max-coast", type=int, default=cfg.get("max_coast", 8), help="最大外推帧数")
     ap.add_argument("--csv", default="", help="轨迹 CSV 路径（明文）")
     ap.add_argument("--save-video", default="", help="叠加结果视频（明文 mp4）")
@@ -88,6 +94,9 @@ def build_parser(cfg: dict, phytium: bool) -> argparse.ArgumentParser:
     ap.add_argument("--show-backend", default="auto", choices=["auto", "cv2", "tk"],
                     help="窗口后端：auto=有 GUI 的 cv2 则用 cv2，否则用 tkinter")
     ap.add_argument("--fullscreen", action="store_true", help="窗口全屏（演示用）")
+    ap.add_argument("--pipe-size", default="", help="管道输出画布尺寸 WxH（如 1024x600），画面居中留边")
+    ap.add_argument("--pipe", action="store_true",
+                    help="把渲染帧以 bgr24 裸流写 stdout（配合 ffplay 显示，无 tkinter/无 GUI 的板子用）")
     ap.add_argument("--display-scale", type=float, default=1.0,
                     help="显示缩放（窗口模式用，1024x600 屏建议 0.55）")
     ap.add_argument("--out-fps", type=float, default=0.0,
@@ -235,6 +244,27 @@ class TkWindow:
             pass
 
 
+def _heading_consistency(points, sample=2):
+    """方向一致性 R = |mean(单位向量)|；1=笔直，0=来回乱窜。"""
+    import math
+    if len(points) < 4:
+        return 1.0
+    ux = uy = 0.0
+    n = 0
+    for i in range(sample, len(points)):
+        dx = points[i][0] - points[i - sample][0]
+        dy = points[i][1] - points[i - sample][1]
+        d = math.hypot(dx, dy)
+        if d < 1e-6:
+            continue
+        ux += dx / d
+        uy += dy / d
+        n += 1
+    if n < 3:
+        return 1.0
+    return math.hypot(ux / n, uy / n)
+
+
 def draw(frame: np.ndarray, tracks: list) -> np.ndarray:
     out = frame.copy()
     for t in tracks:
@@ -371,11 +401,13 @@ def main() -> int:
     if csv_fh:
         csv_fh.write("track_id,frame,x1,y1,x2,y2,px_per_frame,kmh\n")
 
-    if args.async_mode and not want_show:
-        # 无窗口（csv/video）时外推没有意义：输出速度不受显示帧率限制，
-        # 异步只会让主循环跑空、统计为 0。强制同步，保证每帧都真正处理。
-        print("提示：无窗口模式自动关闭异步（仅窗口演示使用异步外推）")
-        args.async_mode = False
+    if want_show and not args.no_async:
+        # 有窗口时强制异步：显示按帧率出，检测按算力跑，保证稳定 10 fps
+        args.async_mode = True
+        print("窗口模式：强制异步渲染（--no-async 可关闭）")
+    elif args.async_mode and not want_show:
+        # 无窗口：尊重用户/config 的选择，不强制改
+        print("无窗口模式：异步已开启（可用 --no-async 关闭，或调 --async-wait 控制积压）")
     if args.async_mode and args.out_fps <= 0:
         if want_video:
             args.out_fps = cap.get(cv2.CAP_PROP_FPS) or 10.0
@@ -384,6 +416,12 @@ def main() -> int:
         print("异步模式：输出限速 %.1f fps（0 表示无显示/视频时按帧阻塞等结果）" % args.out_fps)
 
     win = None
+    if args.pipe:
+        want_show = False
+        import sys as _sys
+        _pipe_out = _sys.stdout.buffer
+    else:
+        _pipe_out = None
     if want_show:
         backend = args.show_backend
         if backend == "auto":
@@ -395,6 +433,8 @@ def main() -> int:
 
     runner = AsyncRunner(pipe) if args.async_mode else None
     last_tracks = []
+    hist_by_id = {}
+    waited = 0
     last_by_id = {}
     vx = {}
     vy = {}
@@ -414,7 +454,16 @@ def main() -> int:
 
         if runner is not None:
             runner.submit(frame)
-            res = runner.poll() if out_period > 0 else runner.wait(5.0)
+            if out_period > 0:
+                res = runner.poll()
+                if res is None:
+                    waited += 1
+                    if waited * out_period >= getattr(args, 'async_wait', 2.0):   # 积压超限：阻塞等结果
+                        res = runner.wait(getattr(args, 'async_wait', 2.0))
+                        waited = 0
+            else:
+                res = runner.wait(max(getattr(args, 'async_wait', 2.0), 0.1))
+                waited = 0
             if res is not None:
                 tracks = res
                 for t in tracks:                       # 记录逐 ID 位移，供外推
@@ -436,6 +485,19 @@ def main() -> int:
                 tracks = []
         else:
             tracks = pipe.step(frame)
+        # 方向一致性门禁（两个后端通用）：来回乱窜的轨迹不输出
+        if not args.no_straight_filter:
+            for t_ in tracks:
+                hid = t_["track_id"]
+                b = t_["box"]
+                hist_by_id.setdefault(hid, collections.deque(maxlen=20)).append(
+                    ((b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5))
+            kept = []
+            for t_ in tracks:
+                r = _heading_consistency(hist_by_id.get(t_["track_id"], []))
+                if r >= args.straight_min:
+                    kept.append(t_)
+            tracks = kept
         total_trk += len(tracks)
 
         if csv_fh:
@@ -443,8 +505,26 @@ def main() -> int:
                 csv_fh.write("%d,%d,%.2f,%.2f,%.2f,%.2f,%.4f,%.1f\n" % (
                     t["track_id"], n, t["box"][0], t["box"][1], t["box"][2], t["box"][3],
                     t["px"], t["kmh"]))
-        if writer is not None or want_show:
+        if writer is not None or want_show or _pipe_out is not None:
             vis = draw(frame, tracks)
+            if _pipe_out is not None:
+                shown = vis
+                if args.display_scale and args.display_scale != 1.0:
+                    shown = cv2.resize(vis, None, fx=args.display_scale, fy=args.display_scale,
+                                       interpolation=cv2.INTER_AREA)
+                if args.pipe_size:
+                    try:
+                        cw, ch = [int(x) for x in args.pipe_size.lower().split("x")]
+                    except ValueError:
+                        cw, ch = shown.shape[1], shown.shape[0]
+                    canvas = np.zeros((ch, cw, 3), np.uint8)
+                    h0 = max(0, (ch - shown.shape[0]) // 2)
+                    w0 = max(0, (cw - shown.shape[1]) // 2)
+                    hh = min(shown.shape[0], ch)
+                    ww = min(shown.shape[1], cw)
+                    canvas[h0:h0 + hh, w0:w0 + ww] = shown[:hh, :ww]
+                    shown = canvas
+                _pipe_out.write(shown.tobytes())
             if writer is not None:
                 writer.write(vis)
             if want_show:
