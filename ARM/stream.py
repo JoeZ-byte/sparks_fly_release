@@ -73,6 +73,8 @@ def build_parser(cfg: dict, phytium: bool) -> argparse.ArgumentParser:
     ap.add_argument("--conf", type=float, default=0.2, help="置信度阈值（对 logit）")
     ap.add_argument("--frames", type=int, default=0, help="只处理前 N 帧（0=全部）")
     ap.add_argument("--warmup", type=int, default=0, help="前 N 帧只更新背景")
+    ap.add_argument("--prewarm", type=int, default=0,
+                    help="预热：先静默跑 N 帧建立背景/轨迹，再从头开始输出（演示用，建议 10~20）")
     ap.add_argument("--flow-w", type=float, default=cfg.get("flow_w", 1.0),
                     help="光流速度先验权重（默认 1.0；--no-flow 关闭）")
     ap.add_argument("--no-flow", action="store_true", help="关闭光流速度先验")
@@ -300,6 +302,17 @@ def main() -> int:
     if not cap.isOpened():
         print("打不开视频: %s" % video_path, file=sys.stderr)
         return 2
+
+    # ---- 预热：静默跑 N 帧把背景与轨迹建立起来，再回卷到第 1 帧 ----
+    if args.prewarm > 0:
+        t_pw = time.time()
+        for _ in range(args.prewarm):
+            ok, f = cap.read()
+            if not ok:
+                break
+            pipe.step(f)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        print("预热 %d 帧完成（%.1fs），背景与轨迹已建立" % (args.prewarm, time.time() - t_pw))
 
     # ---- 输出模式 ----
     mode = args.mode
