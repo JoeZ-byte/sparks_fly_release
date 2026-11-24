@@ -1548,8 +1548,7 @@ def main() -> int:
     return 0
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+# 旧入口已废弃：见文件末尾的统一入口（等价 python stream.py --backend python）
 
 
 # =====================================================================
@@ -1700,3 +1699,20 @@ class PyPipeline:
 
     def close(self) -> None:
         self.sess = None
+
+
+if __name__ == "__main__":
+    # 统一入口：本文件是纯 Python 参考实现，命令行与 stream.py 保持同一套功能。
+    # 直接运行本文件等价于 `python stream.py --backend python ...`，避免两份 CLI 漂移。
+    import importlib.util
+    from pathlib import Path as _P
+
+    _stream = _P(__file__).resolve().parent.parent / "stream.py"
+    if not _stream.exists():
+        print("请用：python stream.py --backend python ...", file=sys.stderr)
+        raise SystemExit(2)
+    sys.argv = [str(_stream), "--backend", "python"] + sys.argv[1:]
+    _spec = importlib.util.spec_from_file_location("satstream_main", _stream)
+    _mod = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    raise SystemExit(_mod.main())
