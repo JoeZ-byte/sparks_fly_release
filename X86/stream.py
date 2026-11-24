@@ -326,7 +326,7 @@ def main() -> int:
                               gate=args.gate, max_coast=args.max_coast,
                               warmup=args.warmup, lib_path=args.native_lib or None)
     else:
-        from pipeline_py import PyPipeline
+        from py_core import Pipeline as PyPipeline
         pipe = PyPipeline(model, imgsz=args.imgsz, max_cells=args.max_cells,
                           threads=args.threads, conf=args.conf, flow_w=flow_w,
                           pre_mode=0 if args.no_tophat else 1, min_hits=args.min_hits,
