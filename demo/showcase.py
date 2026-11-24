@@ -30,6 +30,36 @@ def _propose_wrapped(self, *a, **k):
 
 MotionProposer.propose = _propose_wrapped
 
+
+from PIL import Image as _PImg, ImageDraw as _PDraw, ImageFont as _PFont
+
+_FONT_CACHE = {}
+
+
+def _font(size):
+    if size in _FONT_CACHE:
+        return _FONT_CACHE[size]
+    cands = ["C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/simhei.ttf",
+             "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+             "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]
+    for c in cands:
+        if Path(c).exists():
+            f = _PFont.truetype(c, size)
+            break
+    else:
+        f = _PFont.load_default()
+    _FONT_CACHE[size] = f
+    return f
+
+
+def put_cn(img, text, xy, size=26, color=(255, 255, 255)):
+    """用 PIL 画中文（cv2.putText 不支持 CJK）。"""
+    pil = _PImg.fromarray(img[:, :, ::-1])
+    _PDraw.Draw(pil).text(xy, text, font=_font(size), fill=color)
+    img[:] = np.asarray(pil)[:, :, ::-1]
+
+
 STAGES = [
     ("阶段 1  原始输入", "1024x1024 卫星视频流 @10fps，逐帧读入"),
     ("阶段 2  运动掩膜", "半分辨率灰度 + 3x3 白顶帽 -> 帧差(阈值40) -> 3x3 椭圆闭运算降噪"),
@@ -59,29 +89,24 @@ def compose(frame, stage, st):
                             (x1, max(12, y1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
                             (255, 255, 255), 1, cv2.LINE_AA)
     cv2.rectangle(vis, (0, 0), (w, 34), (0, 0, 0), -1)
-    cv2.putText(vis, STAGES[stage][0], (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                (255, 255, 255), 2, cv2.LINE_AA)
+    put_cn(vis, STAGES[stage][0], (10, 4), 26)
     info = "frame %d  tiles %d  tracks %d  %.1f ms" % (
         st.get("frame", 0), st.get("tiles", 0), len(st.get("tracks", [])), st.get("ms", 0.0))
-    cv2.putText(vis, info, (w - 440, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+    cv2.putText(vis, info, (w - 400, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
                 (200, 255, 200), 1, cv2.LINE_AA)
     cv2.rectangle(vis, (0, h - 56), (w, h), (0, 0, 0), -1)
-    cv2.putText(vis, STAGES[stage][1][:92], (10, h - 20), cv2.FONT_HERSHEY_SIMPLEX,
-                0.5, (220, 220, 220), 1, cv2.LINE_AA)
+    put_cn(vis, STAGES[stage][1][:44], (10, h - 46), 22, (220, 220, 220))
     return vis
 
 
 def card(title, sub):
     img = np.zeros((1024, 1024, 3), np.uint8)
-    cv2.putText(img, title, (60, 470), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (255, 255, 255),
-                3, cv2.LINE_AA)
+    put_cn(img, title, (60, 430), 44)
     y = 540
     for line in sub.split("|"):
-        cv2.putText(img, line, (60, y), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (200, 200, 200),
-                    2, cv2.LINE_AA)
+        put_cn(img, line, (60, y - 20), 24, (200, 200, 200))
         y += 46
-    cv2.putText(img, "satstream", (60, 960), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                (120, 120, 120), 1, cv2.LINE_AA)
+    put_cn(img, "satstream", (60, 940), 22, (120, 120, 120))
     return img
 
 
